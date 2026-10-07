@@ -121,7 +121,8 @@ WA_FLAGS_arm64-x18v = -lntdll
 WA_FLAGS_arm64-x18path = -lntdll
 wine-arm64-tests:
 	mkdir -p build/wine-arm64-tests
-	$(MAKE) -s -j$(shell sysctl -n hw.ncpu) $(WA_TESTS) build/wine-arm64-tests/x64-x18path.exe build/wine-arm64-tests/winshot
+	$(MAKE) -s -j$(shell sysctl -n hw.ncpu) $(WA_TESTS) build/wine-arm64-tests/x64-x18path.exe \
+		build/wine-arm64-tests/x64-globalroot.exe build/wine-arm64-tests/winshot
 build/wine-arm64-tests/arm64-%.exe: wine-arm64/tests/arm64-%.c
 	$(MINGW_BIN)/aarch64-w64-mingw32-clang $(WA_FLAGS) -o $@ $< $(WA_FLAGS_$(basename $(@F)))
 build/wine-arm64-tests/arm64ec-%.exe: wine-arm64/tests/arm64ec-%.c
@@ -133,6 +134,9 @@ build/wine-arm64-tests/x64-%.exe: wine-arm64/tests/x64-%.cpp
 # arm64-x18path's source built for x64 too: its paths under FEX (ship-base spec §9, T2).
 build/wine-arm64-tests/x64-x18path.exe: wine-arm64/tests/arm64-x18path.c
 	$(MINGW_BIN)/x86_64-w64-mingw32-clang $(WA_FLAGS) -o $@ $< $(WA_FLAGS_arm64-x18path)
+# arm64-globalroot's source built for x64 too: the file opens AoE2DE's anti-tamper makes, under FEX (aoe2 patch 23).
+build/wine-arm64-tests/x64-globalroot.exe: wine-arm64/tests/arm64-globalroot.c
+	$(MINGW_BIN)/x86_64-w64-mingw32-clang $(WA_FLAGS) -o $@ $<
 build/wine-arm64-tests/winshot: wine-arm64/tools/winshot.c
 	/usr/bin/clang -O1 -o $@ $< -framework CoreGraphics -framework ImageIO -framework CoreFoundation
 

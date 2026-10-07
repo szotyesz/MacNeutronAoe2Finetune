@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 10:59:22 +0200
+Subject: [PATCH] ntdll: Accept \??\GLOBALROOT in front of a DOS-namespace file
+ name.
+
+\??\GLOBALROOT links to the root of the object namespace, so
+\??\GLOBALROOT\??\X and \??\GLOBALROOT\DosDevices\X name the same file
+as \??\X. Programs build such names by putting \\?\GLOBALROOT in front of
+what NtQueryVirtualMemory(MemoryMappedFilenameInformation) returns, which
+on Wine is a \??\ name. get_dos_prefix_len() recognised only \??\ and
+\DosDevices\, so nt_to_unix_file_name() took the name for a native object
+path and the open failed with STATUS_OBJECT_NAME_NOT_FOUND.
+
+Age of Empires II: Definitive Edition (Arxan anti-tamper) opens its own
+executable and AoE2DE.dat this way to verify them. When that failed it
+left its code encrypted and died on it ("Unhandled illegal instruction at
+0000000142B9A04C", exit 84) before showing a window; with this it reaches
+its main menu. Found by the aoe2 fork's N3 (finding N3-F1), reduced to
+wine-arm64/tests/arm64-globalroot.c.
+
+Skip any leading \??\GLOBALROOT before checking for the DOS prefixes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/file.c | 25 +++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 1bfec7a..d869f9a 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -3363,14 +3363,23 @@ failed:
+ static inline int get_dos_prefix_len( const UNICODE_STRING *name )
+ {
+     static const WCHAR dosdev_prefixW[] = {'\\','D','o','s','D','e','v','i','c','e','s','\\'};
+-
+-    if (name->Length >= sizeof(nt_prefixW) &&
+-        !memcmp( name->Buffer, nt_prefixW, sizeof(nt_prefixW) ))
+-        return ARRAY_SIZE( nt_prefixW );
+-
+-    if (name->Length >= sizeof(dosdev_prefixW) &&
+-        !wcsnicmp( name->Buffer, dosdev_prefixW, ARRAY_SIZE( dosdev_prefixW )))
+-        return ARRAY_SIZE( dosdev_prefixW );
++    static const WCHAR globalrootW[] = {'\\','?','?','\\','G','L','O','B','A','L','R','O','O','T'};
++    const WCHAR *buffer = name->Buffer;
++    unsigned int len = name->Length / sizeof(WCHAR), skip = 0;
++
++    /* \??\GLOBALROOT links to the root of the namespace, so \??\GLOBALROOT\??\X and \??\GLOBALROOT\DosDevices\X
++     * name the same file as \??\X. Programs build such names from MemoryMappedFilenameInformation. */
++    while (len - skip > ARRAY_SIZE( globalrootW ) && buffer[skip + ARRAY_SIZE( globalrootW )] == '\\' &&
++           !wcsnicmp( buffer + skip, globalrootW, ARRAY_SIZE( globalrootW )))
++        skip += ARRAY_SIZE( globalrootW );
++
++    if (len - skip >= ARRAY_SIZE( nt_prefixW ) &&
++        !memcmp( buffer + skip, nt_prefixW, sizeof(nt_prefixW) ))
++        return skip + ARRAY_SIZE( nt_prefixW );
++
++    if (len - skip >= ARRAY_SIZE( dosdev_prefixW ) &&
++        !wcsnicmp( buffer + skip, dosdev_prefixW, ARRAY_SIZE( dosdev_prefixW )))
++        return skip + ARRAY_SIZE( dosdev_prefixW );
+ 
+     return 0;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -238,6 +238,8 @@ re-clone; that is why they wait for the rebase.
   - 0022 (a thread-control signal in unix code on a stack of its own, as dyld's dlopen runs, counts as inside the
     syscall; `check.sh apcsuspend`) is the aoe2 fork's, offered to MacNeutron: it uses the x18 state that patches
     0004/0017-0019 track.
+  - 0023 (`\??\GLOBALROOT\??\X` and `\??\GLOBALROOT\DosDevices\X` name the file `\??\X`; `check.sh globalroot`) is
+    the aoe2 fork's: AoE2DE's anti-tamper opens its own files that way. It is generic Wine, so it can be offered upstream.
 - **FreeType** (2.14.3) is used under the FreeType License (FTL); the bundle carries its credit in
   `licenses/README` and its texts in `licenses/freetype/`. **gnutls** (3.8.13, with its included libtasn1) is
   LGPL-2.1+ and its included libunistring LGPL-3+; **nettle** (4.0) and **GMP** (6.3.0), linked into

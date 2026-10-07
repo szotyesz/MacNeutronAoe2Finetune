@@ -39,13 +39,13 @@ export WINEMSYNC=1
 # NEEDS_FEX: the x64 steps, which run after `fex` registers FEX in that prefix (else Wine's stub xtajit64 runs them).
 # NEEDS_DXMT: the steps that run DXMT, after `dxmt` puts its front ends in that prefix.
 G1="g1-hello g1-seh g1-threads g1-kuser g1-smc g1-tsc g1-unaligned"
-STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend"
+STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot"
 STEPS="$STEPS g5-jit"
 STEPS="$STEPS fonts-tls steam-bridge dxmt dxmt-present dxmt-arm64ec dxmt-x64 g4-bench"
 NEEDS_DXMT="dxmt-present dxmt-arm64ec dxmt-x64"
-NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend g5-jit fonts-tls steam-bridge"
+NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot g5-jit fonts-tls steam-bridge"
 NEEDS_PREFIX="$NEEDS_PREFIX dxmt $NEEDS_DXMT g4-bench"
-NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend g5-jit steam-bridge $NEEDS_DXMT g4-bench"
+NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend globalroot g5-jit steam-bridge $NEEDS_DXMT g4-bench"
 
 # The processes running the runtime's executables. Wine rewrites argv, so `pkill -f <path>` finds nothing; the kernel
 # knows the executable. The Rosetta tool folders' (the launcher, Wine and its server): g4-bench's, and the reference's
@@ -219,6 +219,9 @@ fex_cmd() {
   printf '%s\n' "$out" | grep -q 'REG_SZ *libarm64ecfex\.dll$' \
     || { echo "the amd64 emulator is not libarm64ecfex.dll"; return 1; }
 }
+
+# A file opened through \\?\GLOBALROOT, as AoE2DE's anti-tamper opens its own executable (patch 23): native and under FEX.
+globalroot_cmd() { exe_cmd arm64-globalroot && exe_cmd x64-globalroot; }
 
 # Gate G1's hello: x64 code under FEX, with the exception and DLL-load traces in $WORK/x64-hello.err.
 g1_hello_cmd() {
@@ -606,6 +609,7 @@ run_step() {
     g1-unaligned) step g1-unaligned 60 exe_cmd x64-unaligned ;;
     # A system APC sent to an x64 process while it starts (patch 22): without it the child dies loading FEX's unixlib.
     apcsuspend) step apcsuspend 120 exe_cmd x64-apcsuspend alloc ;;
+    globalroot) step globalroot 60 globalroot_cmd ;;
     g5-jit) step g5-jit 600 g5_jit_cmd; grep '^info ' "$WORK/g5-jit.log" ;;
     fonts-tls) step fonts-tls 60 fonts_tls_cmd ;;
     steam-bridge) step steam-bridge 300 steam_bridge_cmd; grep '^info ' "$WORK/steam-bridge.log" ;;
