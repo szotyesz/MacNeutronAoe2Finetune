@@ -11,7 +11,7 @@ fresh macOS install with the work on an external SSD, and what to do next. The d
 | N0 | Skipped (no signed MacNeutron release used) |
 | N1 — build it here | **Passed.** Ad-hoc signing mode (`MACNEUTRON_ADHOC=1`). A clean-checkout rebuild passes every `check.sh` step this project may run, `steam-bridge` (with AoE2DE's `steam_api64.dll`) and `dxmt-present` included |
 | N2 — audit | **In progress.** Every ported suite passes in the native and FEX lanes (P0, M0 41/41 ×2, W^X scan, x18 signal stress). Wine patches 0021 (write-watched RWX spin) and 0022 (signal on dyld's stack) fix the two bugs found. Open: 10 winetest units that fail only, or differently, under FEX (`n2.md`, "Open") |
-| N3 — AoE2DE | **In progress.** G-INSTALL passes (Windows depots through Mac Steam). Wine patch 0023 (`\??\GLOBALROOT` file names) fixes start-up: the game reaches its main menu, signed in to Steam. Open: N3-F2 (crash about 80 s after a Steam launch: nested exception on the signal stack, at `_sigtramp`); N3-F3 (about 720,000 illegal-instruction exceptions from Arxan in 80 s); the user saw clicks ignored and garbled graphics in the menu |
+| N3 — AoE2DE | **In progress.** G-INSTALL passes. Patch 0023 (`\??\GLOBALROOT`) fixes start-up; patch 0024 fixes the hang reporter's futex deadlock (N3-F4). With the user's 27 subscribed mods start-up stalls for minutes (N3-F6, cause open) and the reporter fires; with mods disabled the game reaches its main menu from Steam and plays single-player. Open: G-TEXT (unreadable text in the main menu), N3-F5 (a second reporter deadlock path), N3-F6 (`results/n3.md`) |
 | N4, N5 | Not started |
 
 Commits on `aoe2` since the plan: `5959601` (N1 ad-hoc mode), `d799f74` (N2 tests, patches 0021–0022), `21a013f` (N1
