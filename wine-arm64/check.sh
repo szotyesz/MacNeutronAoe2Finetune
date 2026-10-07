@@ -5,7 +5,8 @@
 # for their D3DMetal reference, need the frozen Rosetta reference (tools/freeze-rosetta-reference.sh;
 # MACNEUTRON_REFERENCE names another), run by its own launcher. dxmt-x64's FSR 3 check needs SMITE 2 installed
 # (Steam): its amd_fidelityfx_dx12.dll, read from the game's install, never copied. steam-bridge needs `make bridge`,
-# Steam running and logged in, and AoE2DE installed (its steam_api64.dll, read in place; MACNEUTRON_STEAM_API).
+# Steam running and logged in, and SMITE 2 installed (its steam_api64.dll, read in place), or MACNEUTRON_STEAM_API naming
+# another game's steam_api64.dll (the aoe2 fork uses AoE2DE's), as release.sh's R3 does.
 # Every run starts fresh: a new clone of the staged bundle, a new prefix. The clone sits at a path with a space, as the
 # app installs it. A step that needs a prefix gets one from `boot`, which runs first if it isn't named.
 # Nothing of the runtime is left after the script exits, whatever the reason: the last line is PASS or FAIL orphans.
@@ -38,13 +39,13 @@ export WINEMSYNC=1
 # NEEDS_FEX: the x64 steps, which run after `fex` registers FEX in that prefix (else Wine's stub xtajit64 runs them).
 # NEEDS_DXMT: the steps that run DXMT, after `dxmt` puts its front ends in that prefix.
 G1="g1-hello g1-seh g1-threads g1-kuser g1-smc g1-tsc g1-unaligned"
-STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxflip-x64 msync x18"
+STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot"
 STEPS="$STEPS g5-jit"
 STEPS="$STEPS fonts-tls steam-bridge dxmt dxmt-present dxmt-arm64ec dxmt-x64 g4-bench"
 NEEDS_DXMT="dxmt-present dxmt-arm64ec dxmt-x64"
-NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxflip-x64 msync x18 g5-jit fonts-tls steam-bridge"
+NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot g5-jit fonts-tls steam-bridge"
 NEEDS_PREFIX="$NEEDS_PREFIX dxmt $NEEDS_DXMT g4-bench"
-NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 g5-jit steam-bridge $NEEDS_DXMT g4-bench"
+NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend globalroot g5-jit steam-bridge $NEEDS_DXMT g4-bench"
 
 # The processes running the runtime's executables. Wine rewrites argv, so `pkill -f <path>` finds nothing; the kernel
 # knows the executable. The Rosetta tool folders' (the launcher, Wine and its server): g4-bench's, and the reference's
@@ -197,10 +198,11 @@ unentitled_cmd() {
 exe_cmd() {
   t=$1; shift
   out=$(wine_run "$TESTS/$t.exe" "$@" 2> "$WORK/$t.err" | tr -d '\r') || true  # CRLF line ends: text mode on a pipe
-  echo "$out" | LC_ALL=C /usr/bin/grep -qx "PASS $t" && { echo "$out"; return 0; }
+  # printf, not echo: a program printing a Windows path ("…\clean\…") would hit echo's \c and lose its PASS line
+  printf '%s\n' "$out" | LC_ALL=C /usr/bin/grep -qx "PASS $t" && { printf '%s\n' "$out"; return 0; }
   echo "the last lines of ${WORK#"$ROOT"/}/$t.err:"
   tr -d '\r' < "$WORK/$t.err" | tail -n 5
-  echo "$out"
+  printf '%s\n' "$out"
   return 1
 }
 
@@ -218,6 +220,9 @@ fex_cmd() {
   printf '%s\n' "$out" | grep -q 'REG_SZ *libarm64ecfex\.dll$' \
     || { echo "the amd64 emulator is not libarm64ecfex.dll"; return 1; }
 }
+
+# A file opened through \\?\GLOBALROOT, as AoE2DE's anti-tamper opens its own executable (patch 23): native and under FEX.
+globalroot_cmd() { exe_cmd arm64-globalroot && exe_cmd x64-globalroot; }
 
 # Gate G1's hello: x64 code under FEX, with the exception and DLL-load traces in $WORK/x64-hello.err.
 g1_hello_cmd() {
@@ -372,14 +377,15 @@ fonts_tls_cmd() {
 
 # Gate S7 (ship-base spec §7): the Steam bridge on this runtime. bridge/check.sh in arm64 mode (the aarch64 steam.exe,
 # no Steam needed), then bridge/probe.sh in arm64 mode: the bundle's lsteamclient.dll as steamclient64.dll, the x64
-# steamprobe.exe under FEX with a game's steam_api64.dll (AoE2DE's), against Mac Steam's steamclient.dylib (or the one in
+# steamprobe.exe under FEX with SMITE 2's steam_api64.dll, against Mac Steam's steamclient.dylib (or the one in
 # STEAM_COMPAT_CLIENT_INSTALL_PATH, passed through). PROBE_REDACT=1: the log never holds the SteamID or persona name.
 # The crash dialog is off, so a crash ends the run. The x18 hits in Valve's arm64 code (data after ret today) are
 # reported, not gated. The probe's redaction self-test runs first.
 # Gate L3 (release spec §9): then both again through the launcher of a tool folder assembled from this runtime with
 # `macneutron install`, in one compat folder (bridge/check.sh's launcher pass, then the probe as Steam starts a game).
-# This fork reads AoE2DE's steam_api64.dll (app 813780) instead of SMITE 2's; MACNEUTRON_STEAM_API names another game's.
-STEAM_API="${MACNEUTRON_STEAM_API:-$HOME/Library/Application Support/Steam/steamapps/common/AoE2DE/steam_api64.dll}"
+SMITE2_API="$HOME/Library/Application Support/Steam/steamapps/common/SMITE 2/Windows/Engine/Binaries/ThirdParty"
+SMITE2_API="$SMITE2_API/Steamworks/Steamv157/Win64/steam_api64.dll"
+STEAM_API="${MACNEUTRON_STEAM_API:-$SMITE2_API}"  # the game DLL the steam-bridge probe loads
 MAC_STEAM="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
 # probe_rows <run>: the redacted probe output in $out (exit $rc) has every row, and an auth ticket of more than 0 bytes.
 probe_rows() {
@@ -401,7 +407,7 @@ steam_bridge_cmd() {
     || { echo "FAIL steam-bridge: the probe's redaction self-test failed"; return 1; }
   client="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$MAC_STEAM}"
   [ -f "$client/steamclient.dylib" ] || { echo "Steam's steamclient.dylib not found at $client/steamclient.dylib"; return 1; }
-  [ -f "$STEAM_API" ] || { echo "no steam_api64.dll at $STEAM_API: is AoE2DE installed? (MACNEUTRON_STEAM_API)"; return 1; }
+  [ -f "$STEAM_API" ] || { echo "no steam_api64.dll at $STEAM_API (SMITE 2 isn't installed; MACNEUTRON_STEAM_API names another)"; return 1; }
   wine_run reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f || return 1
   out=$(BRIDGE_CHECK_WORK="$WORK/steam-bridge ü" MACNEUTRON_ARM64_APP="$TOOL" MACNEUTRON_ARM64_PREFIX="$PFX" \
     sh "$ROOT/bridge/check.sh" 2>&1) && rc=0 || rc=$?
@@ -596,10 +602,15 @@ run_step() {
     g2-litmus) step g2-litmus 1800 g2_litmus_cmd; grep '^info ' "$WORK/g2-litmus.log" ;;
     viewec) step viewec 60 exe_cmd arm64ec-viewec ;;
     wxflip) step wxflip 60 wxflip_cmd; grep '^info ' "$WORK/wxflip.log" ;;
+    # The flip in a write-watched view (patch 21): without it the program spins on its second write, so the cap ends it.
+    wxwatch) step wxwatch 60 exe_cmd arm64-wxwatch ;;
     wxflip-x64) step wxflip-x64 60 wxflip_x64_cmd; grep '^info ' "$WORK/wxflip-x64.log" ;;
     msync) step msync 300 msync_cmd; grep '^info ' "$WORK/msync.log" ;;
     x18) step x18 180 x18_cmd; grep '^info ' "$WORK/x18.log" ;;
     g1-unaligned) step g1-unaligned 60 exe_cmd x64-unaligned ;;
+    # A system APC sent to an x64 process while it starts (patch 22): without it the child dies loading FEX's unixlib.
+    apcsuspend) step apcsuspend 120 exe_cmd x64-apcsuspend alloc ;;
+    globalroot) step globalroot 60 globalroot_cmd ;;
     g5-jit) step g5-jit 600 g5_jit_cmd; grep '^info ' "$WORK/g5-jit.log" ;;
     fonts-tls) step fonts-tls 60 fonts_tls_cmd ;;
     steam-bridge) step steam-bridge 300 steam_bridge_cmd; grep '^info ' "$WORK/steam-bridge.log" ;;

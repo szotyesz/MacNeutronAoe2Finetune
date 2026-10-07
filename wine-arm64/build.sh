@@ -4,8 +4,8 @@
 # and fex-unixlib, DXMT (dxmt/pins' commit + wine-arm64/patches/dxmt) for ARM64X into dxmt-install, and Proton's
 # lsteamclient (deps.pins' commit + wine-arm64/patches/lsteamclient) as one of Wine's DLLs, then stages the signed
 # build/wine-arm64/wine.app (native arm64 spec §5.4, §6.3; arm64 DXMT spec §4; ship-base spec §5, §7). Never installs
-# tools. Needs MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE, or MACNEUTRON_ADHOC=1 (lib.sh).
-# BUILD_DIR replaces build/ (tests).
+# tools. Needs MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE, or MACNEUTRON_ADHOC=1 on a Mac with SIP
+# and AMFI off (lib.sh). BUILD_DIR replaces build/ (tests).
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/wine-arm64/pins"
@@ -109,8 +109,8 @@ lsc_series=$(tree_series lsteamclient)
 # Every build input, once: the up-to-date check and the stamp written at the end must agree.
 stamp=$(stamp_of "$ROOT/wine-arm64/pins" "$PATCHES"/*.patch "$FEX_PATCHES"/*.patch "$ROOT/wine-arm64/build.sh" \
   "$ROOT/wine-arm64/lib.sh" "$ROOT/wine-arm64/bundle.sh" "$ROOT/wine-arm64/wine.entitlements" \
-  "$ROOT/wine-arm64/Info.plist" "$ROOT/dxmt/pins" "$DXMT_PATCHES"/*.patch "$ROOT/dxmt/llvm.sh" \
-  "$ROOT/dxmt/tools/dxil-probe.cpp" "$ROOT/dxmt/tools/dxil-translate.mm" "$ROOT/wine-arm64/licenses/NOTICES.md" \
+  "$ROOT/wine-arm64/wine-adhoc.entitlements" "$ROOT/wine-arm64/Info.plist" "$ROOT/dxmt/pins" "$DXMT_PATCHES"/*.patch \
+  "$ROOT/dxmt/llvm.sh" "$ROOT/dxmt/tools/dxil-probe.cpp" "$ROOT/dxmt/tools/dxil-translate.mm" "$ROOT/wine-arm64/licenses/NOTICES.md" \
   "$ROOT/wine-arm64/licenses/README" "$ROOT/wine-arm64/tests/licences_test.sh" "$ROOT/wine-arm64/deps.pins" \
   "$ROOT/dxmt/fetch.sh" "$ROOT/wine-arm64/x18-allow.txt" "$ROOT/wine-arm64/tools/x18scan.sh" "$LSC_PATCHES"/*.patch \
   "$ROOT/presenter/present.m" "$ROOT/LICENSE" "$ROOT/wine-arm64/tools/xcrun-metal.sh")

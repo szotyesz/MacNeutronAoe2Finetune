@@ -4,8 +4,8 @@
 # bundle.sh --release --version <V> --out <folder> (arm64 release spec §5.2, release/release.sh) stages
 # <folder>/wine.app from the same build tree instead, never over build/wine-arm64: version <V>, its own SOURCE naming
 # HEAD, and before signing, no debug info, no import libraries, no Wine developer tools and no build path.
-# Needs MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE, or MACNEUTRON_ADHOC=1 (lib.sh's check_signing).
-# BUILD_DIR replaces build/ (tests).
+# Needs MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE, or MACNEUTRON_ADHOC=1 (lib.sh; never with
+# --release). BUILD_DIR replaces build/ (tests).
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/wine-arm64/lib.sh"
@@ -44,6 +44,7 @@ export MACOSX_DEPLOYMENT_TARGET=27.0
 
 [ -z "$release" ] || ! adhoc || die "a release is never ad hoc: unset MACNEUTRON_ADHOC"
 check_signing
+ENTITLEMENTS=$(entitlements_file)
 [ -x "$BUILD/loader/wine" ] || die "no Wine build at $BUILD: run make wine-arm64"
 [ -f "$FEX_DLL" ] && [ -f "$FEX_SO" ] || die "no FEX build in $B/wine-arm64-src: run make wine-arm64"
 [ -d "$DXMT_IN" ] || die "no DXMT build at $DXMT_IN: run make wine-arm64"
@@ -138,9 +139,13 @@ cp "$ROOT/wine-arm64/Info.plist" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" \
   -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist" > /dev/null \
   || die "can't write the version into Info.plist"
-# Without its extended attributes: a downloaded profile carries the download's URL and quarantine record. macOS gives
-# the copy the source's quarantine again even with -X, so that one goes explicitly. An ad-hoc bundle has no profile.
-if ! adhoc; then
+if adhoc; then
+  # Ad hoc (lib.sh): no profile, and the bundle says so, so nobody mistakes it for a build that runs with SIP on.
+  /usr/libexec/PlistBuddy -c "Add :MacNeutronSigning string adhoc-sip-amfi-disabled-only" "$APP/Contents/Info.plist" \
+    > /dev/null || die "can't mark Info.plist as ad hoc"
+else
+  # Without its extended attributes: a downloaded profile carries the download's URL and quarantine record. macOS gives
+  # the copy the source's quarantine again even with -X, so that one goes explicitly.
   cp -X "$MACNEUTRON_PROVISIONING_PROFILE" "$APP/Contents/embedded.provisionprofile"
   xattr -d com.apple.quarantine "$APP/Contents/embedded.provisionprofile" 2> /dev/null || true
   out=$(xattr "$APP/Contents/embedded.provisionprofile") || die "can't list embedded.provisionprofile's attributes"
@@ -188,7 +193,7 @@ fi
 macho | grep -vxF "$LOADER" | tr '\n' '\0' \
   | xargs -0 codesign -f -s "$MACNEUTRON_SIGN_IDENTITY" --options runtime > "$OUT/sign.log" 2>&1 \
   || die "signing the libraries failed; see $OUT/sign.log"
-codesign -f -s "$MACNEUTRON_SIGN_IDENTITY" --options runtime --entitlements "$ROOT/wine-arm64/wine.entitlements" "$APP" \
+codesign -f -s "$MACNEUTRON_SIGN_IDENTITY" --options runtime --entitlements "$ENTITLEMENTS" "$APP" \
   >> "$OUT/sign.log" 2>&1 || die "signing the bundle failed; see $OUT/sign.log"
 
 # 3. Assert. Each failure names its check.
@@ -203,8 +208,12 @@ macho > "$OUT/macho.list"
 while IFS= read -r f; do
   minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/ { b = 1 } b && /minos/ { print $2; exit }')
   [ "$minos" = 27.0 ] || die "minos of ${f#"$APP"/} is ${minos:-missing}, not 27.0"
-  # An ad-hoc signature carries no timestamp.
-  adhoc || codesign -dvv "$f" 2>&1 | LC_ALL=C /usr/bin/grep -q '^Timestamp=' || die "${f#"$APP"/} has no secure timestamp"
+  # An ad-hoc signature has no timestamp; it has to be ad hoc throughout instead.
+  if adhoc; then
+    codesign -dvv "$f" 2>&1 | LC_ALL=C /usr/bin/grep -qx 'Signature=adhoc' || die "${f#"$APP"/} is not signed ad hoc"
+  else
+    codesign -dvv "$f" 2>&1 | LC_ALL=C /usr/bin/grep -q '^Timestamp=' || die "${f#"$APP"/} has no secure timestamp"
+  fi
   # What it links (after otool -L's file line and, for a dylib, its own ID): the system's, or the bundle's own.
   skip=2; [ -z "$(otool -D "$f" | tail -n +2)" ] || skip=3
   out=$(otool -L "$f" | tail -n +$skip | awk '{ print $1 }' \
@@ -295,7 +304,7 @@ out=$({ nm -gU "$U/ntdll.so" | awk '{ print "x", $3 }'; nm -u "$lso" | LC_ALL=C 
   | sed 's/^/w /'; } | awk '$1 == "x" { e[$2] = 1; next } !e[$2] { print substr($2, 2) }')
 [ -z "$out" ] || die "lsteamclient.so needs $(echo "$out" | tr '\n' ' ')from ntdll.so, which doesn't export it"
 codesign -d --entitlements - "$LOADER" 2>&1 | LC_ALL=C /usr/bin/grep -q com.apple.security.cs.disable-library-validation \
-  || die "the loader lacks com.apple.security.cs.disable-library-validation (wine.entitlements)"
+  || die "the loader lacks com.apple.security.cs.disable-library-validation (${ENTITLEMENTS##*/})"
 others=$(macho | grep '/wine$' | grep -vxF "$LOADER" || true)
 [ -z "$others" ] || die "another Mach-O named wine: $others"
 # Version resources: every shipped module whose Makefile.in sets a VER_ variable carries a VS_FIXEDFILEINFO (its
