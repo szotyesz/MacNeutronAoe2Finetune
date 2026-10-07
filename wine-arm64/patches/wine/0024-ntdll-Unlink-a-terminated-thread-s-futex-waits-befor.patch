@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 21:57:17 +0200
+Subject: [PATCH] ntdll: Unlink a terminated thread's futex waits before an
+ ARM64EC emulator frees its stack.
+
+RtlWaitOnAddress() links an entry on the waiter's stack into a futex
+queue and unlinks it when the wait returns. A thread terminated by
+another thread while it waits never returns, so its entry stayed
+linked: a later RtlWakeAddressSingle() woke the dead thread instead of a
+live waiter, and once the entry's memory was freed the next wake on that
+queue read freed memory while holding the queue's spinlock. FEX's
+ThreadTerm frees the terminated thread's emulator stack, where FEX's
+own mutex waits keep their entries.
+
+Age of Empires II: Definitive Edition's hang reporter terminates its
+watchdog thread at start-up. The next wake on that queue faulted inside
+RtlWakeAddressAll(); the access violation went to FEX's
+ResetToConsistentState, which takes ThreadCreationMutex, whose release
+wakes waiters through the same queue: the thread spun on its own lock
+forever and the game showed a black window or exited. Found by the aoe2
+fork's N3 (finding N3-F4), reduced to
+wine-arm64/tests/arm64ec-futexterm.c.
+
+On ARM64EC, NtTerminateThread() now stops another thread of the process
+and unlinks its entries (futex_forget_thread) before ThreadTerm runs,
+and resumes it if the termination fails. The spinlock holds its owner's
+thread ID, so a thread stopped inside it is let run until it leaves it.
+Pure ARM64 and other architectures keep the old behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/ntdll_misc.h     |  3 ++
+ dlls/ntdll/signal_arm64ec.c | 38 +++++++++++++++++++++--
+ dlls/ntdll/sync.c           | 62 ++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 100 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index 2bf3cfa..755d4f4 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -185,4 +185,7 @@ extern void *__os_arm64x_helper8;
+ 
+ #endif
+ 
++/* sync.c */
++extern void futex_forget_thread( HANDLE thread, DWORD tid );
++
+ #endif
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 923ba88..9c6123c 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -854,8 +854,36 @@ NTSTATUS SYSCALL_API NtTerminateProcess( HANDLE handle, LONG exit_code )
+     return syscall_NtTerminateProcess( handle, exit_code );
+ }
+ 
++/* Stops another thread of this process that is being terminated and unlinks its futex queue entries, before the
++ * emulator's ThreadTerm frees its emulator stack (futex_forget_thread). Returns a handle to resume it with if the
++ * termination fails, or NULL. */
++static HANDLE stop_terminated_thread( HANDLE handle )
++{
++    THREAD_BASIC_INFORMATION info;
++    HANDLE thread;
++    CONTEXT context;
++
++    if (NtDuplicateObject( NtCurrentProcess(), handle, NtCurrentProcess(), &thread,
++                           THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, 0 ))
++        return NULL;
++    if (NtQueryInformationThread( thread, ThreadBasicInformation, &info, sizeof(info), NULL ) ||
++        info.ExitStatus != STATUS_PENDING ||
++        info.ClientId.UniqueProcess != NtCurrentTeb()->ClientId.UniqueProcess ||
++        info.ClientId.UniqueThread == NtCurrentTeb()->ClientId.UniqueThread ||
++        NtSuspendThread( thread, NULL ))
++    {
++        NtClose( thread );
++        return NULL;
++    }
++    context.ContextFlags = CONTEXT_CONTROL;
++    NtGetContextThread( thread, &context );  /* returns once the thread has stopped */
++    futex_forget_thread( thread, HandleToULong( info.ClientId.UniqueThread ) );
++    return thread;
++}
++
+ NTSTATUS SYSCALL_API NtTerminateThread( HANDLE handle, LONG exit_code )
+ {
++    HANDLE stopped = stop_terminated_thread( handle );
+     NTSTATUS status;
+ 
+     if (pThreadTerm && enter_syscall_callback())
+@@ -863,9 +891,15 @@ NTSTATUS SYSCALL_API NtTerminateThread( HANDLE handle, LONG exit_code )
+         pThreadTerm( handle, exit_code );
+         status = syscall_NtTerminateThread( handle, exit_code );
+         leave_syscall_callback();
+-        return status;
+     }
+-    return syscall_NtTerminateThread( handle, exit_code );
++    else status = syscall_NtTerminateThread( handle, exit_code );
++
++    if (stopped)
++    {
++        if (status) NtResumeThread( stopped, NULL );
++        NtClose( stopped );
++    }
++    return status;
+ }
+ 
+ NTSTATUS SYSCALL_API NtUnmapViewOfSection( HANDLE process, void *addr )
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index ca6dd4a..3a4470a 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -844,9 +844,10 @@ static struct futex_queue *get_futex_queue( const void *addr )
+     return &futex_queues[(val >> 4) % ARRAY_SIZE(futex_queues)];
+ }
+ 
++/* The lock holds its owner's thread ID, so futex_forget_thread() can tell a thread stopped inside it. */
+ static void spin_lock( LONG *lock )
+ {
+-    while (InterlockedCompareExchange( lock, -1, 0 ))
++    while (InterlockedCompareExchange( lock, GetCurrentThreadId(), 0 ))
+         YieldProcessor();
+ }
+ 
+@@ -964,6 +965,65 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+         NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
+ }
+ 
++/* Stops a thread: NtGetContextThread() returns once a suspended thread has stopped. */
++static void stop_thread( HANDLE thread )
++{
++    CONTEXT context;
++
++    NtSuspendThread( thread, NULL );
++    context.ContextFlags = CONTEXT_CONTROL;
++    NtGetContextThread( thread, &context );
++}
++
++/***********************************************************************
++ *           futex_forget_thread
++ *
++ * Unlinks the futex queue entries of a thread that another thread is terminating; the caller has stopped it. The
++ * thread never returns from RtlWaitOnAddress() to unlink them itself, and they live on its stack, which may be freed
++ * with it: an ARM64EC emulator frees the thread's emulator stack, where its own lock waits are. A later wake would read
++ * freed memory while holding the queue's spinlock, or wake the dead thread instead of a live waiter. A thread stopped
++ * inside a queue's spinlock is let run until it leaves it, then stopped again and the queues are walked anew.
++ */
++void futex_forget_thread( HANDLE thread, DWORD tid )
++{
++    unsigned int i;
++    LONG owner;
++
++    for (i = 0; i < ARRAY_SIZE(futex_queues); i++)
++    {
++        struct futex_queue *queue = &futex_queues[i];
++        struct futex_entry *entry, *next;
++
++        while ((owner = InterlockedCompareExchange( &queue->lock, GetCurrentThreadId(), 0 )))
++        {
++            if (owner != tid)
++            {
++                YieldProcessor();
++                continue;
++            }
++            {
++                ULONG count = 0;
++                while (!NtResumeThread( thread, &count ) && count > 1) ;  /* suspended by others too: run it */
++            }
++            while (ReadNoFence( &queue->lock ) == tid) YieldProcessor();
++            stop_thread( thread );
++            i = 0;
++            queue = &futex_queues[0];
++        }
++
++        if (queue->queue.next)
++        {
++            LIST_FOR_EACH_ENTRY_SAFE( entry, next, &queue->queue, struct futex_entry, entry )
++            {
++                if (entry->tid != tid) continue;
++                entry->addr = NULL;
++                list_remove( &entry->entry );
++            }
++        }
++        spin_unlock( &queue->lock );
++    }
++}
++
+ /***********************************************************************
+  *           RtlWakeAddressSingle (NTDLL.@)
+  */
+-- 
+2.54.0 (Apple Git-157)
+
