@@ -15,7 +15,7 @@ Results on the maintainer's Mac: [`docs/testing/acceptance-arm64-wine.md`](../do
 [`docs/testing/acceptance-arm64-ship-base.md`](../docs/testing/acceptance-arm64-ship-base.md).
 
 This is the runtime MacNeutron ships: the app embeds this `wine.app` (`Contents/Helpers/wine.app`) and the launcher runs
-every game on it. A build needs the Developer ID setup below; there is no ad-hoc signed `wine.app`.
+every game on it. A build needs the Developer ID setup below; outside the aoe2 fork's ad-hoc mode (below, for a Mac with SIP and AMFI off) there is no ad-hoc signed `wine.app`.
 
 ## Requirements
 
@@ -35,7 +35,7 @@ every game on it. A build needs the Developer ID setup below; there is no ad-hoc
   Proton's `lsteamclient/` folder from GitHub (18 MB of source, about 10 s here); later builds reuse them.
 - **A Developer ID with the "Cross-architecture Compatibility Framework" capability** (`com.apple.developer.cross-architecture-support`)
   granted for the App ID `net.authspot.macneutron.wine` (team `49QMZXLR8S`), and a Developer ID provisioning profile for it.
-  Without the entitlement the loader can't map the low 4 GB or get 4K pages, so there is no ad-hoc mode.
+  Without the entitlement the loader can't map the low 4 GB or get 4K pages; an ad-hoc signature carries it only on a Mac with SIP and AMFI off (ad-hoc mode, below).
 
 ```sh
 export MACNEUTRON_SIGN_IDENTITY="Developer ID Application: … (49QMZXLR8S)"
@@ -46,6 +46,19 @@ export MACNEUTRON_PROVISIONING_PROFILE=/path/to/the.provisionprofile   # never c
 working runtime. Then change `APP_ID` in `lib.sh` and the identifiers in `wine.entitlements` and `Info.plist` (the
 profile check's test, `tests/profile_test.sh`, and its fixtures name the App ID too), and use your team's identity and
 profile.
+
+**Ad-hoc mode (aoe2 fork only; never on a normal Mac).** On a macOS 27 install with System Integrity Protection
+disabled and the boot argument `amfi_get_out_of_my_way=0x1`, the kernel honours the cross-architecture entitlement in an
+ad-hoc signature (`aoe2/entitlement.md` has the probe). `MACNEUTRON_ADHOC=1` builds for that machine: it refuses to run
+unless both settings are found, and with either signing variable set; it signs everything ad hoc with
+`wine-adhoc.entitlements` (the same entitlements without the maintainer's App ID and team), embeds no provisioning
+profile, checks for ad-hoc signatures instead of secure timestamps, and marks the bundle's `Info.plist` with
+`MacNeutronSigning = adhoc-sip-amfi-disabled-only`. `bundle.sh --release` (and so `make release`) refuses it. Such a
+`wine.app` is killed at exec on any Mac with SIP or AMFI enforcing.
+
+```sh
+MACNEUTRON_ADHOC=1 make wine-arm64
+```
 
 ## Build and check
 
@@ -143,7 +156,7 @@ SteamID or the persona name; run it by hand the same way. The x18 hits in Valve'
 | `deps.pins` | The four tarballs (FreeType, gnutls, nettle, GMP), and lsteamclient's repository and commit |
 | `patches/wine/`, `patches/fex/`, `patches/dxmt/`, `patches/lsteamclient/` | The patch series (`git format-patch` output, applied with `git am`): the source of truth |
 | `build.sh`, `bundle.sh` | Build, then assemble and sign `wine.app`, and check the result |
-| `wine.entitlements`, `Info.plist` | The loader's entitlements and the bundle's identity |
+| `wine.entitlements`, `wine-adhoc.entitlements`, `Info.plist` | The loader's entitlements (Developer ID; ad-hoc mode) and the bundle's identity |
 | `licenses/` | The bundle's `licenses/README` (component, licence, source) and `NOTICES.md` (notices found only in source headers); `bundle.sh` adds the licence texts and `SOURCE` |
 | `x18-allow.txt` | The only x18 hits `bundle.sh`'s scan accepts (file, routine, count) |
 | `check.sh`, `tests/`, `tools/` | The checks, the test programs (`x64-*`, `arm64*`), the licence test, and the helpers behind G3, G4, D2 (`winshot`) and the x18 scan (`x18scan.sh`) |

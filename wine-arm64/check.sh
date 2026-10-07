@@ -5,7 +5,8 @@
 # for their D3DMetal reference, need the frozen Rosetta reference (tools/freeze-rosetta-reference.sh;
 # MACNEUTRON_REFERENCE names another), run by its own launcher. dxmt-x64's FSR 3 check needs SMITE 2 installed
 # (Steam): its amd_fidelityfx_dx12.dll, read from the game's install, never copied. steam-bridge needs `make bridge`,
-# Steam running and logged in, and SMITE 2 installed (its steam_api64.dll, read in place).
+# Steam running and logged in, and SMITE 2 installed (its steam_api64.dll, read in place), or MACNEUTRON_STEAM_API naming
+# another game's steam_api64.dll (the aoe2 fork uses AoE2DE's), as release.sh's R3 does.
 # Every run starts fresh: a new clone of the staged bundle, a new prefix. The clone sits at a path with a space, as the
 # app installs it. A step that needs a prefix gets one from `boot`, which runs first if it isn't named.
 # Nothing of the runtime is left after the script exits, whatever the reason: the last line is PASS or FAIL orphans.
@@ -380,6 +381,7 @@ fonts_tls_cmd() {
 # `macneutron install`, in one compat folder (bridge/check.sh's launcher pass, then the probe as Steam starts a game).
 SMITE2_API="$HOME/Library/Application Support/Steam/steamapps/common/SMITE 2/Windows/Engine/Binaries/ThirdParty"
 SMITE2_API="$SMITE2_API/Steamworks/Steamv157/Win64/steam_api64.dll"
+STEAM_API="${MACNEUTRON_STEAM_API:-$SMITE2_API}"  # the game DLL the steam-bridge probe loads
 MAC_STEAM="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
 # probe_rows <run>: the redacted probe output in $out (exit $rc) has every row, and an auth ticket of more than 0 bytes.
 probe_rows() {
@@ -401,7 +403,7 @@ steam_bridge_cmd() {
     || { echo "FAIL steam-bridge: the probe's redaction self-test failed"; return 1; }
   client="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$MAC_STEAM}"
   [ -f "$client/steamclient.dylib" ] || { echo "Steam's steamclient.dylib not found at $client/steamclient.dylib"; return 1; }
-  [ -f "$SMITE2_API" ] || { echo "SMITE 2 isn't installed"; return 1; }
+  [ -f "$STEAM_API" ] || { echo "no steam_api64.dll at $STEAM_API (SMITE 2 isn't installed; MACNEUTRON_STEAM_API names another)"; return 1; }
   wine_run reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f || return 1
   out=$(BRIDGE_CHECK_WORK="$WORK/steam-bridge ü" MACNEUTRON_ARM64_APP="$TOOL" MACNEUTRON_ARM64_PREFIX="$PFX" \
     sh "$ROOT/bridge/check.sh" 2>&1) && rc=0 || rc=$?
@@ -409,7 +411,7 @@ steam_bridge_cmd() {
   [ "$rc" = 0 ] || { echo "FAIL steam-bridge: bridge/check.sh: $(echo "$out" | LC_ALL=C /usr/bin/grep -m 1 '^FAIL' \
     || echo "$out" | tail -n 1)"; return 1; }
   out=$(PROBE_REDACT=1 STEAM_COMPAT_CLIENT_INSTALL_PATH="$client" MACNEUTRON_ARM64_APP="$TOOL" \
-    MACNEUTRON_ARM64_PREFIX="$PFX" sh "$ROOT/bridge/probe.sh" "$SMITE2_API" 2>&1) && rc=0 || rc=$?
+    MACNEUTRON_ARM64_PREFIX="$PFX" sh "$ROOT/bridge/probe.sh" "$STEAM_API" 2>&1) && rc=0 || rc=$?
   probe_rows direct || return 1
   "$ROOT/.build/release/macneutron" install --tool-dir "$BTOOL" --wine-app "$TOOL" \
     --steam-exe "$ROOT/build/bridge/arm64/steam.exe" || return 1
@@ -419,7 +421,7 @@ steam_bridge_cmd() {
   [ "$rc" = 0 ] || { echo "FAIL steam-bridge: bridge/check.sh through the launcher: $(echo "$out" \
     | LC_ALL=C /usr/bin/grep -m 1 '^FAIL' || echo "$out" | tail -n 1)"; return 1; }
   out=$(PROBE_REDACT=1 STEAM_COMPAT_CLIENT_INSTALL_PATH="$client" STEAM_COMPAT_DATA_PATH="$BCOMPAT" \
-    MACNEUTRON_TOOL_DIR="$BTOOL" sh "$ROOT/bridge/probe.sh" "$SMITE2_API" 2>&1) && rc=0 || rc=$?
+    MACNEUTRON_TOOL_DIR="$BTOOL" sh "$ROOT/bridge/probe.sh" "$STEAM_API" 2>&1) && rc=0 || rc=$?
   probe_rows launcher || return 1
   if h=$(sh "$ROOT/wine-arm64/tools/x18scan.sh" -arch arm64 "$client/steamclient.dylib"); then
     echo "info steam x18: $(echo "$h" | LC_ALL=C /usr/bin/grep -c . || true) hits"

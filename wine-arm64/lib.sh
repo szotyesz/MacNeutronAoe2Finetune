@@ -127,9 +127,30 @@ check_profile_plist() {  # check_profile_plist <decoded-plist>
   [ "$at" -gt "$(date +%s)" ] || die "profile expired on $exp"
 }
 
+# Ad-hoc mode (aoe2 fork, plan R2 N1): MACNEUTRON_ADHOC=1 signs wine.app ad hoc with wine-adhoc.entitlements, the
+# cross-architecture entitlement without the maintainer's App ID, and embeds no provisioning profile. The kernel honours
+# an ad-hoc entitlement only with SIP disabled and AMFI off (amfi_get_out_of_my_way): on any other Mac the loader is
+# killed at exec, so the mode refuses to build there. Never for a release (bundle.sh --release refuses it).
+adhoc() { [ "${MACNEUTRON_ADHOC:-}" = 1 ]; }
+sip_status() { csrutil status; }          # tests replace these two
+boot_args() { sysctl -n kern.bootargs; }
+check_adhoc_host() {
+  [ -z "${MACNEUTRON_SIGN_IDENTITY:-}" ] || [ "$MACNEUTRON_SIGN_IDENTITY" = - ] \
+    || die "MACNEUTRON_ADHOC=1 signs ad hoc: unset MACNEUTRON_SIGN_IDENTITY"
+  [ -z "${MACNEUTRON_PROVISIONING_PROFILE:-}" ] || die "MACNEUTRON_ADHOC=1 embeds no profile: unset MACNEUTRON_PROVISIONING_PROFILE"
+  sip_status 2> /dev/null | LC_ALL=C /usr/bin/grep -q 'status: disabled' \
+    || die "MACNEUTRON_ADHOC=1 needs System Integrity Protection disabled (csrutil status)"
+  boot_args 2> /dev/null | LC_ALL=C /usr/bin/grep -qE '(^| )amfi_get_out_of_my_way=(0x)?0*[1-9]' \
+    || die "MACNEUTRON_ADHOC=1 needs the boot argument amfi_get_out_of_my_way=0x1"
+}
+# The loader's entitlements for this build's signing mode.
+entitlements_file() { if adhoc; then echo "$ROOT/wine-arm64/wine-adhoc.entitlements"; else echo "$ROOT/wine-arm64/wine.entitlements"; fi; }
+
 # The signing variables are set and name something usable: build.sh checks this before fetching or building (a missing
-# variable costs seconds, not a build), bundle.sh before assembling. There is no ad-hoc mode: an unentitled loader can't boot.
+# variable costs seconds, not a build), bundle.sh before assembling. An unentitled loader can't boot; the only other mode
+# is ad hoc (above), which sets MACNEUTRON_SIGN_IDENTITY to - so its stamp differs from a Developer ID build's.
 check_signing() {
+  if adhoc; then check_adhoc_host; MACNEUTRON_SIGN_IDENTITY=-; return 0; fi
   [ -n "${MACNEUTRON_SIGN_IDENTITY:-}" ] || die "set MACNEUTRON_SIGN_IDENTITY"
   [ -n "${MACNEUTRON_PROVISIONING_PROFILE:-}" ] || die "set MACNEUTRON_PROVISIONING_PROFILE"
   plist=$(mktemp)

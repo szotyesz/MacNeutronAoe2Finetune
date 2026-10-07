@@ -8,7 +8,7 @@ client and run on a native arm64 Wine with FEX (for x86-64 code) and DXMT (Direc
 `docs/superpowers/specs/`.
 
 **Requirements:** an Apple Silicon Mac with macOS 27 or later, and the Steam client for Mac. Building from source also
-needs Xcode 27 (Swift 6) and the Developer ID setup in `wine-arm64/README.md` (there is no ad-hoc signed `wine.app`).
+needs Xcode 27 (Swift 6) and the Developer ID setup in `wine-arm64/README.md` (its ad-hoc mode, `MACNEUTRON_ADHOC=1`, is only for a Mac with SIP and AMFI off).
 
 ## Download and set up
 
