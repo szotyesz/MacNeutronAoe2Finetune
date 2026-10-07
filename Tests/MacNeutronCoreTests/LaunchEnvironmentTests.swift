@@ -21,7 +21,7 @@ private let context = try! CompatContext(environment: ["STEAM_COMPAT_DATA_PATH":
 
 @Test func loggingTurnsOnWineDebugChannels() {
     let env = LaunchEnvironment.build(base: [:], context: context, backend: .dxmt, logging: true)
-    #expect(env["WINEDEBUG"] == "+err,+warn,+loaddll,+steamclient")
+    #expect(env["WINEDEBUG"] == "+err,+warn,+loaddll,+steamclient,+timestamp")
 }
 
 @Test func userSettingsWin() {

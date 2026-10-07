@@ -160,7 +160,7 @@ private func i386Exe(named name: String) throws -> String {
     _ = f.launcher.launch(["run", "/g/Game.exe"], environment: env)
     let gameLog = f.launcher.log.gameLog(appID: "42")
     #expect(f.runner.calls.last?.output == gameLog)
-    #expect(try String(contentsOf: gameLog, encoding: .utf8).contains("WINEDEBUG=+err,+warn,+loaddll,+steamclient"))
+    #expect(try String(contentsOf: gameLog, encoding: .utf8).contains("WINEDEBUG=+err,+warn,+loaddll,+steamclient,+timestamp"))
 }
 
 @Test func everyLaunchIsLoggedWithVersions() throws {
@@ -191,7 +191,7 @@ private func i386Exe(named name: String) throws -> String {
     _ = f.launcher.launch(["run", "/g/Game.exe"], environment: env)
     let wine = try #require(f.runner.calls.last?.environment)
     #expect(wine["WINEDLLOVERRIDES"]?.hasPrefix("dxgi=n,b;d3d10core=n,b;d3d11=n,b") == true)  // dxmt
-    #expect(wine["WINEDEBUG"] == "+err,+warn,+loaddll,+steamclient")
+    #expect(wine["WINEDEBUG"] == "+err,+warn,+loaddll,+steamclient,+timestamp")
     #expect(wine["WINEMSYNC"] == nil)
 }
 

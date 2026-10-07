@@ -9,7 +9,7 @@ public enum LaunchEnvironment {
         env["WINEPREFIX"] = context.prefix.path(percentEncoded: false)
         env["WINEDLLOVERRIDES"] = mergeOverrides(backend.dllOverrides, user: base["WINEDLLOVERRIDES"])
         if base["WINEDEBUG"] == nil {
-            env["WINEDEBUG"] = logging ? "+err,+warn,+loaddll,+steamclient" : "-all"
+            env["WINEDEBUG"] = logging ? "+err,+warn,+loaddll,+steamclient,+timestamp" : "-all"
         }
         // msync off means unset, whoever set it: Wine's client and server must agree on it.
         if base["MACNEUTRON_NO_MSYNC"] == "1" {
