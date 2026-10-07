@@ -198,10 +198,11 @@ unentitled_cmd() {
 exe_cmd() {
   t=$1; shift
   out=$(wine_run "$TESTS/$t.exe" "$@" 2> "$WORK/$t.err" | tr -d '\r') || true  # CRLF line ends: text mode on a pipe
-  echo "$out" | LC_ALL=C /usr/bin/grep -qx "PASS $t" && { echo "$out"; return 0; }
+  # printf, not echo: a program printing a Windows path ("…\clean\…") would hit echo's \c and lose its PASS line
+  printf '%s\n' "$out" | LC_ALL=C /usr/bin/grep -qx "PASS $t" && { printf '%s\n' "$out"; return 0; }
   echo "the last lines of ${WORK#"$ROOT"/}/$t.err:"
   tr -d '\r' < "$WORK/$t.err" | tail -n 5
-  echo "$out"
+  printf '%s\n' "$out"
   return 1
 }
 
