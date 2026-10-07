@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 05:02:09 +0200
+Subject: [PATCH] ntdll: Treat a signal in unix code on a foreign stack as
+ inside the syscall.
+
+usr1_handler, usr2_handler and quit_handler decide whether the interrupted
+code is unix code by the stack alone: between the kernel stack and the
+syscall frame. macOS's dyld runs dlopen on a stack of its own, so a signal
+during a syscall's dlopen was taken for PE code. An ARM64EC process loads
+FEX's unix library through NtQueryVirtualMemory while it starts; a system
+APC sent to it then (a remote NtAllocateVirtualMemory or
+NtFreeVirtualMemory: SIGUSR1) saved and restored the host state as a
+user-mode context, faulted in _platform_memmove on the signal stack
+("nested exception on signal stack") and the process died. Every later
+remote call failed with STATUS_PROCESS_IS_TERMINATING.
+
+Found by the aoe2 fork's N2 winetest lanes: kernel32 sync failed 34270
+checks under FEX (2 natively), its test_apc_deadlock child dying at start.
+Reduced to wine-arm64/tests/x64-apcsuspend.c (mode alloc), which killed the
+x64 child in every run.
+
+x18_call knows whether the custom x18 ABI was on at the signal: on in PE
+code only. Record that for the handler it runs, and count a signal as
+inside the syscall when the ABI was off and the stack is neither the
+kernel stack nor the thread's PE stack. Elsewhere the kernel-stack test
+stands: the dispatchers' entry and exit run with the ABI off on the PE
+stack, and usr1_handler deals with them by their PCs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/signal_arm64.c | 31 ++++++++++++++++++++++++++++---
+ 1 file changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index f0de3c1..98d8dc4 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -70,6 +70,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
+ struct arm64_thread_data
+ {
+     BOOL suspend_pending;
++    int  signal_mode;  /* x18_call, for the handler it runs: 1 interrupted unix code, 2 PE code, 0 not known */
+ };
+ 
+ C_ASSERT( sizeof(struct arm64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
+@@ -1384,6 +1385,23 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ }
+ 
+ 
++/* Whether a thread-control signal (SIGUSR1, SIGUSR2, SIGQUIT) interrupted unix code. The kernel-stack test misses
++ * one case: macOS's dyld runs dlopen on a stack of its own, so a signal during a syscall's dlopen (a unix library
++ * loaded by NtQueryVirtualMemory, as an ARM64EC process does for FEX while it starts) was taken for PE code, and the
++ * host state was saved and restored as a user-mode context: a nested fault, and the process died. Unix code is
++ * what x18_call saw running with the custom x18 ABI off; on a stack that is neither the kernel stack nor the thread's
++ * PE stack, that is the answer. Anywhere else the kernel-stack test stands (the dispatchers' entry and exit run with
++ * the ABI off on the PE stack, and usr1_handler deals with them by their PCs). */
++static inline BOOL signal_inside_syscall( struct thread_data *data, ucontext_t *sigcontext )
++{
++    ULONG_PTR sp = SP_sig(sigcontext);
++
++    if (is_inside_syscall( data, sp )) return TRUE;
++    return arm64_thread_data( data )->signal_mode == 1 &&
++           !(sp >= (ULONG_PTR)data->teb->DeallocationStack && sp < (ULONG_PTR)data->teb->Tib.StackBase);
++}
++
++
+ /**********************************************************************
+  *		quit_handler
+  *
+@@ -1394,7 +1412,7 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     ucontext_t *sigcontext = _sigcontext;
+     struct thread_data *data = get_thread_data();
+ 
+-    if (is_inside_syscall( data, SP_sig(sigcontext) )) abort_thread(0);
++    if (signal_inside_syscall( data, sigcontext )) abort_thread(0);
+     user_mode_abort_thread( 0, get_syscall_frame( data ));
+ }
+ 
+@@ -1482,7 +1500,7 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+             arm64_thread_data( data )->suspend_pending = TRUE;
+         }
+     }
+-    else if (is_inside_syscall( data, SP_sig(sigcontext) ))
++    else if (signal_inside_syscall( data, sigcontext ))
+     {
+         context.ContextFlags = CONTEXT_FULL | CONTEXT_ARM64_X18 | CONTEXT_EXCEPTION_REQUEST;
+         NtGetContextThread( GetCurrentThread(), &context );
+@@ -1511,7 +1529,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     struct syscall_frame *frame = get_syscall_frame( data );
+     DWORD i;
+ 
+-    if (!is_inside_syscall( data, SP_sig(sigcontext) )) return;
++    if (!signal_inside_syscall( data, sigcontext )) return;
+     if (!frame) return;
+ 
+     if (is_emulated_code( frame->pc ))
+@@ -1588,6 +1606,7 @@ static void x18_call( void (*handler)( int, siginfo_t *, void * ), BOOL keep, in
+     ULONG_PTR pc = PC_sig(sigcontext), sp = SP_sig(sigcontext);
+     BOOL was_on = os_custom_x18_abi_enabled(), on;
+     struct thread_data *data;
++    int saved_mode = 0;
+ 
+     if (was_on) os_set_custom_x18_abi_enabled( false );  /* before any libc call */
+     if (sig == SIGTRAP && x18_toggle_trap( sigcontext ))
+@@ -1609,7 +1628,13 @@ static void x18_call( void (*handler)( int, siginfo_t *, void * ), BOOL keep, in
+         abort();
+     }
+ 
++    if (data && data->teb)  /* for signal_inside_syscall; a nested signal restores the outer handler's */
++    {
++        saved_mode = arm64_thread_data( data )->signal_mode;
++        arm64_thread_data( data )->signal_mode = was_on ? 2 : 1;
++    }
+     handler( sig, siginfo, _sigcontext );
++    if (data && data->teb) arm64_thread_data( data )->signal_mode = saved_mode;
+ 
+     if (keep || (PC_sig(sigcontext) == pc && SP_sig(sigcontext) == sp) || !data || !data->teb) on = was_on;
+     else on = PC_sig(sigcontext) == (ULONG_PTR)pKiUserExceptionDispatcher ||
+-- 
+2.54.0 (Apple Git-157)
+

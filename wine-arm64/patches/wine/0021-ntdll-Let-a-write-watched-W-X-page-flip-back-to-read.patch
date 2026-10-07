@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 04:22:23 +0200
+Subject: [PATCH] ntdll: Let a write-watched W^X page flip back to read-write
+ on a write fault.
+
+Patch 0006 keeps a PAGE_EXECUTE_READWRITE page read-write or read-exec on
+macOS arm64 and flips it on the fault. In a MEM_WRITE_WATCH view the flip
+back to read-write never happened: after a run the host page is read-exec,
+but virtual_handle_fault's "ignore fault if page is writable now" check
+reads the page's vprot, which still says writable, finds a write-watch
+range and returns STATUS_SUCCESS without changing the host protection. The
+W^X flip after it only runs when ret is still an error, so the write
+faults again, forever: the thread spins at 100% CPU in the signal handler.
+
+Found by the aoe2 fork's N2 suite (A64-EXEC-ROLLBACK: a write-watched
+pair made PAGE_EXECUTE_READWRITE, written, run, then rewritten); reduced to
+wine-arm64/tests/arm64-wxwatch.c, which hangs after its first run.
+
+Skip that check for a W^X-degraded page and let the flip make it writable.
+A page whose write watch was just cleared is already read-write (mprotect_exec
+degrades exec+write to write), so the flip's mprotect is a no-op there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index e6fb30a..62d6bea 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4780,6 +4780,11 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+         /* ignore fault if page is writable now */
+         if (get_unix_prot( get_host_page_vprot( page )) & PROT_WRITE)
+         {
++#if defined(__APPLE__) && defined(__aarch64__)
++            /* not for a W^X-degraded page: its host protection may be read-exec after a flip although
++             * its vprot is writable, so the fault is real; the flip below makes it writable */
++            if (!is_vprot_exec_write( get_host_page_vprot( page )))
++#endif
+             if ((vprot & VPROT_WRITEWATCH) || is_write_watch_range( page, 1 ))
+                 ret = STATUS_SUCCESS;
+         }
+-- 
+2.54.0 (Apple Git-157)
+

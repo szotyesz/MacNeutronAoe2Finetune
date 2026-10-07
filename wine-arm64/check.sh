@@ -39,13 +39,13 @@ export WINEMSYNC=1
 # NEEDS_FEX: the x64 steps, which run after `fex` registers FEX in that prefix (else Wine's stub xtajit64 runs them).
 # NEEDS_DXMT: the steps that run DXMT, after `dxmt` puts its front ends in that prefix.
 G1="g1-hello g1-seh g1-threads g1-kuser g1-smc g1-tsc g1-unaligned"
-STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxflip-x64 msync x18"
+STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend"
 STEPS="$STEPS g5-jit"
 STEPS="$STEPS fonts-tls steam-bridge dxmt dxmt-present dxmt-arm64ec dxmt-x64 g4-bench"
 NEEDS_DXMT="dxmt-present dxmt-arm64ec dxmt-x64"
-NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxflip-x64 msync x18 g5-jit fonts-tls steam-bridge"
+NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend g5-jit fonts-tls steam-bridge"
 NEEDS_PREFIX="$NEEDS_PREFIX dxmt $NEEDS_DXMT g4-bench"
-NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 g5-jit steam-bridge $NEEDS_DXMT g4-bench"
+NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend g5-jit steam-bridge $NEEDS_DXMT g4-bench"
 
 # The processes running the runtime's executables. Wine rewrites argv, so `pkill -f <path>` finds nothing; the kernel
 # knows the executable. The Rosetta tool folders' (the launcher, Wine and its server): g4-bench's, and the reference's
@@ -598,10 +598,14 @@ run_step() {
     g2-litmus) step g2-litmus 1800 g2_litmus_cmd; grep '^info ' "$WORK/g2-litmus.log" ;;
     viewec) step viewec 60 exe_cmd arm64ec-viewec ;;
     wxflip) step wxflip 60 wxflip_cmd; grep '^info ' "$WORK/wxflip.log" ;;
+    # The flip in a write-watched view (patch 21): without it the program spins on its second write, so the cap ends it.
+    wxwatch) step wxwatch 60 exe_cmd arm64-wxwatch ;;
     wxflip-x64) step wxflip-x64 60 wxflip_x64_cmd; grep '^info ' "$WORK/wxflip-x64.log" ;;
     msync) step msync 300 msync_cmd; grep '^info ' "$WORK/msync.log" ;;
     x18) step x18 180 x18_cmd; grep '^info ' "$WORK/x18.log" ;;
     g1-unaligned) step g1-unaligned 60 exe_cmd x64-unaligned ;;
+    # A system APC sent to an x64 process while it starts (patch 22): without it the child dies loading FEX's unixlib.
+    apcsuspend) step apcsuspend 120 exe_cmd x64-apcsuspend alloc ;;
     g5-jit) step g5-jit 600 g5_jit_cmd; grep '^info ' "$WORK/g5-jit.log" ;;
     fonts-tls) step fonts-tls 60 fonts_tls_cmd ;;
     steam-bridge) step steam-bridge 300 steam_bridge_cmd; grep '^info ' "$WORK/steam-bridge.log" ;;

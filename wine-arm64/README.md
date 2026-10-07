@@ -233,6 +233,11 @@ re-clone; that is why they wait for the rebase.
   - 0016 (registering `dlls/lsteamclient` in configure) and the other Wine patches are ours.
   - 0020 (makedep links the resources of a module built for the hybrid arch only, which lost its version resource)
     is ours and stays local: it isn't proposed upstream.
+  - 0021 (a write-watched W^X page flips back to read-write on a write fault; `check.sh wxwatch`) is the aoe2 fork's,
+    offered to MacNeutron: it fixes patch 0006's flip, so it belongs beside it rather than upstream in Wine.
+  - 0022 (a thread-control signal in unix code on a stack of its own, as dyld's dlopen runs, counts as inside the
+    syscall; `check.sh apcsuspend`) is the aoe2 fork's, offered to MacNeutron: it uses the x18 state that patches
+    0004/0017-0019 track.
 - **FreeType** (2.14.3) is used under the FreeType License (FTL); the bundle carries its credit in
   `licenses/README` and its texts in `licenses/freetype/`. **gnutls** (3.8.13, with its included libtasn1) is
   LGPL-2.1+ and its included libunistring LGPL-3+; **nettle** (4.0) and **GMP** (6.3.0), linked into
