@@ -4,7 +4,8 @@
 # bundle.sh --release --version <V> --out <folder> (arm64 release spec §5.2, release/release.sh) stages
 # <folder>/wine.app from the same build tree instead, never over build/wine-arm64: version <V>, its own SOURCE naming
 # HEAD, and before signing, no debug info, no import libraries, no Wine developer tools and no build path.
-# Needs MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE. BUILD_DIR replaces build/ (tests).
+# Needs MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE, or MACNEUTRON_ADHOC=1 (lib.sh's check_signing).
+# BUILD_DIR replaces build/ (tests).
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/wine-arm64/lib.sh"
@@ -41,6 +42,7 @@ R="$APP/Contents/Resources"
 INSTALL="$OUT/install.tmp"
 export MACOSX_DEPLOYMENT_TARGET=27.0
 
+[ -z "$release" ] || ! adhoc || die "a release is never ad hoc: unset MACNEUTRON_ADHOC"
 check_signing
 [ -x "$BUILD/loader/wine" ] || die "no Wine build at $BUILD: run make wine-arm64"
 [ -f "$FEX_DLL" ] && [ -f "$FEX_SO" ] || die "no FEX build in $B/wine-arm64-src: run make wine-arm64"
@@ -137,12 +139,14 @@ cp "$ROOT/wine-arm64/Info.plist" "$APP/Contents/Info.plist"
   -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist" > /dev/null \
   || die "can't write the version into Info.plist"
 # Without its extended attributes: a downloaded profile carries the download's URL and quarantine record. macOS gives
-# the copy the source's quarantine again even with -X, so that one goes explicitly.
-cp -X "$MACNEUTRON_PROVISIONING_PROFILE" "$APP/Contents/embedded.provisionprofile"
-xattr -d com.apple.quarantine "$APP/Contents/embedded.provisionprofile" 2> /dev/null || true
-out=$(xattr "$APP/Contents/embedded.provisionprofile") || die "can't list embedded.provisionprofile's attributes"
-out=$(printf '%s\n' "$out" | LC_ALL=C /usr/bin/grep -xE 'com\.apple\.(metadata:kMDItemWhereFroms|quarantine)' || true)
-[ -z "$out" ] || die "embedded.provisionprofile kept $(echo "$out" | tr '\n' ' ')"
+# the copy the source's quarantine again even with -X, so that one goes explicitly. An ad-hoc bundle has no profile.
+if ! adhoc; then
+  cp -X "$MACNEUTRON_PROVISIONING_PROFILE" "$APP/Contents/embedded.provisionprofile"
+  xattr -d com.apple.quarantine "$APP/Contents/embedded.provisionprofile" 2> /dev/null || true
+  out=$(xattr "$APP/Contents/embedded.provisionprofile") || die "can't list embedded.provisionprofile's attributes"
+  out=$(printf '%s\n' "$out" | LC_ALL=C /usr/bin/grep -xE 'com\.apple\.(metadata:kMDItemWhereFroms|quarantine)' || true)
+  [ -z "$out" ] || die "embedded.provisionprofile kept $(echo "$out" | tr '\n' ' ')"
+fi
 
 # The Mach-O files in the bundle, one per line (PE DLLs need no signature).
 macho() { find "$APP" -type f -print0 | xargs -0 file | sed -n 's/: *Mach-O .*//p'; }
@@ -199,7 +203,8 @@ macho > "$OUT/macho.list"
 while IFS= read -r f; do
   minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/ { b = 1 } b && /minos/ { print $2; exit }')
   [ "$minos" = 27.0 ] || die "minos of ${f#"$APP"/} is ${minos:-missing}, not 27.0"
-  codesign -dvv "$f" 2>&1 | LC_ALL=C /usr/bin/grep -q '^Timestamp=' || die "${f#"$APP"/} has no secure timestamp"
+  # An ad-hoc signature carries no timestamp.
+  adhoc || codesign -dvv "$f" 2>&1 | LC_ALL=C /usr/bin/grep -q '^Timestamp=' || die "${f#"$APP"/} has no secure timestamp"
   # What it links (after otool -L's file line and, for a dylib, its own ID): the system's, or the bundle's own.
   skip=2; [ -z "$(otool -D "$f" | tail -n +2)" ] || skip=3
   out=$(otool -L "$f" | tail -n +$skip | awk '{ print $1 }' \

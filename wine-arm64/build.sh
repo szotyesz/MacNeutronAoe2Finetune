@@ -4,7 +4,7 @@
 # and fex-unixlib, DXMT (dxmt/pins' commit + wine-arm64/patches/dxmt) for ARM64X into dxmt-install, and Proton's
 # lsteamclient (deps.pins' commit + wine-arm64/patches/lsteamclient) as one of Wine's DLLs, then stages the signed
 # build/wine-arm64/wine.app (native arm64 spec §5.4, §6.3; arm64 DXMT spec §4; ship-base spec §5, §7). Never installs
-# tools. Needs MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE.
+# tools. Needs MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE, or MACNEUTRON_ADHOC=1 (lib.sh).
 # BUILD_DIR replaces build/ (tests).
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

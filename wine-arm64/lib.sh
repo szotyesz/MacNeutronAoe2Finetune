@@ -127,9 +127,27 @@ check_profile_plist() {  # check_profile_plist <decoded-plist>
   [ "$at" -gt "$(date +%s)" ] || die "profile expired on $exp"
 }
 
+# MACNEUTRON_ADHOC=1, this fork's ad-hoc mode: wine.app signed ad hoc with the same entitlements and no provisioning
+# profile. The kernel honours the cross-architecture entitlement of an ad-hoc signature only with SIP disabled and
+# AMFI out of the way (boot-arg amfi_get_out_of_my_way=1), so such a bundle runs on that Mac alone: never a release.
+adhoc() { [ "${MACNEUTRON_ADHOC:-}" = 1 ]; }
+
 # The signing variables are set and name something usable: build.sh checks this before fetching or building (a missing
-# variable costs seconds, not a build), bundle.sh before assembling. There is no ad-hoc mode: an unentitled loader can't boot.
+# variable costs seconds, not a build), bundle.sh before assembling. Without MACNEUTRON_ADHOC=1 an unentitled loader
+# can't boot, so a Developer ID and its profile are required; with it, this Mac must be one that runs an ad-hoc loader,
+# and MACNEUTRON_SIGN_IDENTITY becomes - (codesign's ad-hoc identity, which stamp_of then records).
 check_signing() {
+  if adhoc; then
+    [ "${MACNEUTRON_SIGN_IDENTITY:--}" = - ] || die "MACNEUTRON_ADHOC=1 signs ad hoc: unset MACNEUTRON_SIGN_IDENTITY"
+    [ -z "${MACNEUTRON_PROVISIONING_PROFILE:-}" ] \
+      || die "MACNEUTRON_ADHOC=1 embeds no profile: unset MACNEUTRON_PROVISIONING_PROFILE"
+    csrutil status 2> /dev/null | LC_ALL=C /usr/bin/grep -q 'status: disabled' \
+      || die "MACNEUTRON_ADHOC=1 needs System Integrity Protection disabled (csrutil status)"
+    sysctl -n kern.bootargs | LC_ALL=C /usr/bin/grep -Eq '(^| )amfi_get_out_of_my_way=(1|0x1)( |$)' \
+      || die "MACNEUTRON_ADHOC=1 needs the boot-arg amfi_get_out_of_my_way=1"
+    MACNEUTRON_SIGN_IDENTITY=-
+    return 0
+  fi
   [ -n "${MACNEUTRON_SIGN_IDENTITY:-}" ] || die "set MACNEUTRON_SIGN_IDENTITY"
   [ -n "${MACNEUTRON_PROVISIONING_PROFILE:-}" ] || die "set MACNEUTRON_PROVISIONING_PROFILE"
   plist=$(mktemp)

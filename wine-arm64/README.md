@@ -42,6 +42,18 @@ export MACNEUTRON_SIGN_IDENTITY="Developer ID Application: … (49QMZXLR8S)"
 export MACNEUTRON_PROVISIONING_PROFILE=/path/to/the.provisionprofile   # never committed
 ```
 
+**Ad-hoc mode (this fork only, for a Mac with SIP disabled and the boot-arg `amfi_get_out_of_my_way=1`).** With
+AMFI out of the way the kernel honours the cross-architecture entitlement of an ad-hoc signature, so `wine.app` can be
+signed with `wine.entitlements` as it is, without a Developer ID or a profile:
+
+```sh
+MACNEUTRON_ADHOC=1 make wine-arm64   # MACNEUTRON_SIGN_IDENTITY and MACNEUTRON_PROVISIONING_PROFILE unset
+```
+
+The build checks the Mac's SIP and boot-args before it starts. Such a `wine.app` runs only on a Mac set up like that.
+It has no embedded profile and no secure timestamp, and `make release` refuses the mode. Never use it on a Mac with
+normal security settings.
+
 **Anyone else needs their own App ID and their own grant** from Apple: only a team with the capability can produce a
 working runtime. Then change `APP_ID` in `lib.sh` and the identifiers in `wine.entitlements` and `Info.plist` (the
 profile check's test, `tests/profile_test.sh`, and its fixtures name the App ID too), and use your team's identity and

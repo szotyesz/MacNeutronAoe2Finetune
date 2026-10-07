@@ -19,6 +19,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/wine-arm64/lib.sh"
 . "$ROOT/release/lib.sh"  # after wine-arm64/lib.sh: its die says release:
+! adhoc || die "a release is never ad hoc: unset MACNEUTRON_ADHOC"
 usage="release: usage: make release VERSION=X.Y.Z (or release.sh X.Y.Z | --rehearse X.Y.Z | --check-version X.Y.Z |\
  --self-test)"
 
