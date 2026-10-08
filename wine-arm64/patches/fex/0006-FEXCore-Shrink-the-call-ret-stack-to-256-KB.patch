@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Szabo <szotyesz@Mac.home>
+Date: Thu, 8 Oct 2026 08:51:34 +0200
+Subject: [PATCH] FEXCore: Shrink the call-ret stack to 256 KB.
+
+Every code invalidation that hits a thread's cached code clears that
+thread's call-ret stack with VirtualDontNeed, which on Windows decommits
+and recommits all of it. Under Wine on macOS that is a mapping change
+over 4 MB, and anti-tamper code that patches its own instructions
+(Age of Empires II: Definitive Edition's) invalidates code thousands of
+times a second: about half the time of each patch went to it.
+
+256 KB still holds 4096 nested calls below the default position; deeper
+call chains overflow into the guard page and reset, as before. A
+benchmark of the patch pattern (MacNeutron's wine-arm64/tests/
+x64-arxantrap.c) went from 26 to 15 us a patch.
+
+Downstream MacNeutron patch, not for upstream FEX, which does not accept
+AI-generated code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/include/FEXCore/Debug/InternalThreadState.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index 42feabb..6193bfd 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -109,7 +109,7 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   ///< Data pointer for exclusive use by the frontend
+   void* FrontendPtr;
+ 
+-  static constexpr size_t CALLRET_STACK_SIZE {0x400000};
++  static constexpr size_t CALLRET_STACK_SIZE {0x40000};
+ 
+   // The low address of the call-ret stack allocation (not including guard pages)
+   void* CallRetStackBase {};
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Szabo <szotyesz@Mac.home>
+Date: Thu, 8 Oct 2026 09:03:10 +0200
+Subject: [PATCH] Windows: Check code on pages rewritten often instead of
+ trapping writes.
+
+Age of Empires II: Definitive Edition's anti-tamper code patches the
+game's own instructions all over its code section, about 19,000 times a
+second while it loads mods. With RWX pages write-protected once they
+hold compiled code, every patch faulted, invalidated the page's code in
+every thread, unprotected it, and the next compile protected it again:
+loading 27 mods took about 95 s of a 2 minute start-up, and three
+threads spent most of it waiting on each other.
+
+A page that takes 16 write faults while holding compiled code is now
+left writable, and blocks compiled from it compare their bytes with
+what was compiled once, on entry, in 16-byte steps; a mismatch drops
+the code and runs the block again from the dispatcher. That is
+SMCChecks=full's check per block instead of per instruction: a tight
+loop on such a page runs 1.08 times as long as on an execute-only one,
+against 1.47 with a check per instruction. Code that rewrites a later
+instruction of the block it is running is not caught; the game's
+patches come from an exception handler, outside the block. The marks
+go when the memory is freed or stops being executable.
+MACNEUTRON_SMC_SELFCHECK sets the threshold; 0 turns it off.
+
+The game now loads the mods in about 24 s and reaches its menu in 35 s.
+Benchmarks: MacNeutron's wine-arm64/tests/x64-arxantrap.c and
+x64-smcspeed.c.
+
+Downstream MacNeutron patch, not for upstream FEX, which does not accept
+AI-generated code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/Core.cpp        | 34 +++++++++++++++-
+ FEXCore/include/FEXCore/HLE/SyscallHandler.h  |  5 +++
+ Source/Windows/ARM64EC/Module.cpp             |  4 ++
+ Source/Windows/Common/InvalidationTracker.cpp | 39 +++++++++++++++++++
+ Source/Windows/Common/InvalidationTracker.h   |  7 ++++
+ 5 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index e05d849..e259e90 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -582,6 +582,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+         }
+       }
+ 
++      const bool FullSMCBlock = Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection;
++      // MacNeutron (downstream only, not for upstream FEX): code on pages the frontend no longer write-protects
++      // checks its bytes once, on entry to the block, instead of before every instruction.
++      const bool SelfCheckedBlock =
++        !FullSMCBlock && SyscallHandler && SyscallHandler->IsSelfCheckedCodeRange(Thread, Block.Entry, std::max<uint64_t>(Block.Size, 1));
++
+       // Set the block entry point
+       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
+ 
+@@ -592,6 +598,32 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+       if (InstsInBlock == 0) {
+         // Special case for an empty instruction block.
+         Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, Block.Entry - GuestRIP));
++      } else if (SelfCheckedBlock) {
++        // Compare the block's bytes with what was compiled, 16 at a time; on a change, drop the entry and run the
++        // block again from the dispatcher, which compiles it anew.
++        auto& Dispatcher = Thread->OpDispatcher;
++        auto CodeWasChangedBlock = Dispatcher->CreateNewCodeBlockAtEnd();
++        for (uint64_t Offset = 0; Offset < Block.Size; Offset += 0x10) {
++          const auto Length = static_cast<uint8_t>(std::min<uint64_t>(0x10, Block.Size - Offset));
++          std::array<uint8_t, 0x10> CodeOriginal {};
++          memcpy(CodeOriginal.data(), reinterpret_cast<const uint8_t*>(Block.Entry + Offset), Length);
++          auto Address = Dispatcher->_EntrypointOffset(GPRSize, Block.Entry + Offset - GuestRIP);
++          auto CodeChanged = Dispatcher->_ValidateCode(CodeOriginal, Address, Length);
++          auto Cond = Dispatcher->CondJump(CodeChanged);
++          auto CurrentBlock = Dispatcher->GetCurrentBlock();
++          Dispatcher->SetTrueJumpTarget(Cond, CodeWasChangedBlock);
++          auto NextBlock = Dispatcher->CreateNewCodeBlockAfter(CurrentBlock);
++          Dispatcher->SetFalseJumpTarget(Cond, NextBlock);
++          Dispatcher->SetCurrentCodeBlock(NextBlock);
++          Dispatcher->StartNewBlock();
++        }
++        auto ContinueBlock = Dispatcher->GetCurrentBlock();
++        Dispatcher->SetCurrentCodeBlock(CodeWasChangedBlock);
++        Dispatcher->StartNewBlock();
++        Dispatcher->_ThreadRemoveCodeEntry();
++        Dispatcher->ExitFunction(Dispatcher->_InlineEntrypointOffset(GPRSize, Block.Entry - GuestRIP));
++        Dispatcher->SetCurrentCodeBlock(ContinueBlock);
++        Dispatcher->StartNewBlock();
+       }
+ 
+       uint64_t BlockInstructionsLength {};
+@@ -635,7 +667,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
+         }
+ 
+-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
++        if (FullSMCBlock) {
+           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
+           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
+           std::array<uint8_t, 0x10> CodeOriginal;
+diff --git a/FEXCore/include/FEXCore/HLE/SyscallHandler.h b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+index d1f4dec..2d6e612 100644
+--- a/FEXCore/include/FEXCore/HLE/SyscallHandler.h
++++ b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+@@ -60,6 +60,11 @@ public:
+   }
+   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
+   virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
++  // MacNeutron: whether code in the range is rewritten so often that its blocks check their own bytes instead of
++  // relying on page protection (as SMCChecks=full does for every block).
++  virtual bool IsSelfCheckedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
++    return false;
++  }
+   virtual void MarkOvercommitRange(uint64_t Start, uint64_t Length) {}
+   virtual void UnmarkOvercommitRange(uint64_t Start, uint64_t Length) {}
+   virtual ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 0d132e9..1c02215 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -546,6 +546,10 @@ public:
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+   }
+ 
++  bool IsSelfCheckedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
++    return InvalidationTracker->IsSelfCheckedRange(Start, Length);
++  }
++
+   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+     OvercommitTracker->MarkRange(Start, Length);
+   }
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index b9e1af2..2401210 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -7,6 +7,7 @@
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include "InvalidationTracker.h"
++#include <cstdlib>
+ #include <windef.h>
+ #include <winternl.h>
+ 
+@@ -16,6 +17,9 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
+   , Threads {Threads} {
+   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
++  if (const char* Threshold = getenv("MACNEUTRON_SMC_SELFCHECK")) {
++    SelfCheckThreshold = static_cast<uint32_t>(strtoul(Threshold, nullptr, 10));
++  }
+ 
+   MEMORY_BASIC_INFORMATION Info;
+   uint64_t Address = 0;
+@@ -77,6 +81,7 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+     } else if (XIntervals.Intersect(ProtInterval)) {
+       XIntervals.Remove(ProtInterval);
+       RWXIntervals.Remove(ProtInterval);
++      SelfCheckedIntervals.Remove(ProtInterval);
+       if (DEPDisabled) {
+         DEPPromotedIntervals.Remove(ProtInterval);
+       }
+@@ -197,6 +202,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
++    SelfCheckedIntervals.Remove({SectionBase, SectionBase + SectionSize});
+   }
+ 
+   return {SectionBase, SectionSize};
+@@ -217,6 +223,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
++    SelfCheckedIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+   }
+ }
+ 
+@@ -240,6 +247,17 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+ 
+       InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+ 
++      // MacNeutron: a page rewritten over and over (anti-tamper code patches its own instructions) stops trapping:
++      // with the compilation lock held, nothing is compiled from it until its blocks check their own bytes.
++      if (SelfCheckThreshold) {
++        const uint64_t Page = FaultAddress & FEXCore::Utils::FEX_PAGE_MASK;
++        std::unique_lock Lock(IntervalsLock);
++        if (++SMCFaultCounts[Page] == SelfCheckThreshold) {
++          SelfCheckedIntervals.Insert({Page, Page + FEXCore::Utils::FEX_PAGE_SIZE});
++          SMCFaultCounts.erase(Page);
++        }
++      }
++
+       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
+       ULONG TmpProt;
+       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+@@ -256,6 +274,19 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
+   return ProtectRWXIntervalsInternal(Address, Size, true);
+ }
+ 
++bool InvalidationTracker::IsSelfCheckedRange(uint64_t Address, uint64_t Size) {
++  std::shared_lock Lock(IntervalsLock);
++  if (SelfCheckedIntervals.Empty()) {
++    return false;
++  }
++  for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK; Page < Address + Size; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
++    if (SelfCheckedIntervals.Query(Page).Enclosed) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+   std::shared_lock Lock(IntervalsLock);
+   const auto XResult = XIntervals.Query(Address);
+@@ -354,6 +385,14 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+     return false;
+   }
+ 
++  if (!ForWriteLocked) {
++    // MacNeutron: self-checked pages stay writable; their blocks check their own bytes.
++    const auto Query = SelfCheckedIntervals.Query(Address);
++    if (Query.Enclosed && Query.Size >= Size) {
++      return false;
++    }
++  }
++
+   bool HitRWXInterval = false;
+   do {
+     const auto Query = RWXIntervals.Query(Address);
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index d2a80bc..ae4aa5a 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -41,6 +41,10 @@ public:
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+ 
++  // MacNeutron: pages that took SelfCheckThreshold write faults on compiled code are no longer write-protected; their
++  // blocks check their own bytes instead (see IsSelfCheckedCodeRange).
++  bool IsSelfCheckedRange(uint64_t Address, uint64_t Size);
++
+ private:
+   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
+   void DisableSMCDetection();
+@@ -66,6 +70,9 @@ private:
+   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
+   bool DEPDisabled {false};                             // Protected by IntervalsLock
+   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
++  FEXCore::IntervalList<uint64_t> SelfCheckedIntervals; // Protected by IntervalsLock
++  std::unordered_map<uint64_t, uint32_t> SMCFaultCounts; // Page -> write faults, protected by IntervalsLock
++  uint32_t SelfCheckThreshold {16};                     // 0 disables (MACNEUTRON_SMC_SELFCHECK)
+ 
+   bool MonoBackpatcherDetectionPending {false};
+   uint64_t MonoBase {0};
+-- 
+2.54.0 (Apple Git-157)
+

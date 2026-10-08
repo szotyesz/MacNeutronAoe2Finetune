@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Szabo <szotyesz@Mac.home>
+Date: Thu, 8 Oct 2026 08:51:34 +0200
+Subject: [PATCH] Windows: Skip the invalidation when an RWX interval becomes
+ execute-only.
+
+Writes to an RWX page that has compiled code trap and invalidate it, so
+when the page is made execute-only again its compiled code already
+matches memory and nothing can write it any more. Anti-tamper code that
+makes a page RWX, patches it and makes it execute-only again paid for a
+second invalidation of every thread's caches on each patch.
+
+Downstream MacNeutron patch, not for upstream FEX, which does not accept
+AI-generated code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/Common/InvalidationTracker.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 155403d..b9e1af2 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -57,6 +57,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+     const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
+ 
+     if (EffectiveExec) {
++      // MacNeutron: an RWX interval made execute-only again needs no invalidation. Writes to an RWX page that has
++      // compiled code trap and invalidate it, so code compiled from it matches memory, and nothing can write it now.
++      // Anti-tamper code that patches a page between two such changes otherwise pays for two invalidations a patch.
++      if (!EffectiveRWX && !(DEPDisabled && !HasExec) && XIntervals.Query(AlignedBase).Enclosed &&
++          RWXIntervals.Query(AlignedBase).Enclosed && RWXIntervals.Query(AlignedBase).Size >= AlignedSize &&
++          XIntervals.Query(AlignedBase).Size >= AlignedSize) {
++        return false;
++      }
+       XIntervals.Insert(ProtInterval);
+       if (EffectiveRWX) {
+         LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
+-- 
+2.54.0 (Apple Git-157)
+

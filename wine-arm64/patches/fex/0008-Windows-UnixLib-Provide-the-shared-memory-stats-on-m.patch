@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Szabo <szotyesz@Mac.home>
+Date: Thu, 8 Oct 2026 08:51:34 +0200
+Subject: [PATCH] Windows/UnixLib: Provide the shared memory stats on macOS.
+
+ProfileStats (the per-thread JIT, signal and SMC counters) needed
+growing a POSIX shared memory object, which macOS does not allow, so the
+unix helper refused on Apple and the stats stayed off. Size the object
+once to the most it may grow to; the pages stay untouched until slots
+use them. It is only created when ProfileStats is set.
+
+Downstream MacNeutron patch, not for upstream FEX, which does not accept
+AI-generated code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/UnixLib/FEXUnixLib.cpp | 35 ++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.cpp b/Source/Windows/UnixLib/FEXUnixLib.cpp
+index bd82e6c..90b66aa 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.cpp
++++ b/Source/Windows/UnixLib/FEXUnixLib.cpp
+@@ -4,6 +4,7 @@
+ #include <fcntl.h>
+ #include <string>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #ifndef __APPLE__
+ #include <sys/prctl.h>
+ #endif
+@@ -193,9 +194,39 @@ err:
+ }
+ #endif
+ 
++#ifdef __APPLE__
++// MacNeutron: macOS sizes a POSIX shared memory object once, so the stats get the most they may grow to up front
++// (MAX_STATS_SIZE, a few MB that stay untouched until slots use them) and growing is a no-op.
++static inline void* InitializeSHMApple(uint32_t MaxSize) {
++  const std::string Name = "fex-" + std::to_string(getpid()) + "-stats";
++  shm_unlink(Name.c_str());
++  int fd = shm_open(Name.c_str(), O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
++  if (fd == -1) {
++    return nullptr;
++  }
++  void* Base = nullptr;
++  if (ftruncate(fd, MaxSize) == 0) {
++    Base = mmap(nullptr, MaxSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (Base == MAP_FAILED) {
++      Base = nullptr;
++    }
++  }
++  close(fd);
++  if (!Base) {
++    shm_unlink(Name.c_str());
++  }
++  return Base;
++}
++#endif
++
+ static NTSTATUS FEXUnixLib_GetSHMStatsVMAHandler([[maybe_unused]] void* _Args) {
+ #ifdef __APPLE__
+-  return STATUS_NOT_SUPPORTED;
++  auto Args = reinterpret_cast<FEXUnixLib_GetSHMStatsVMA*>(_Args);
++  if (Args->SHMBase == nullptr) {
++    Args->SHMBase = InitializeSHMApple(Args->MaxSize);
++    return Args->SHMBase ? STATUS_SUCCESS : STATUS_INTERNAL_ERROR;
++  }
++  return Args->MapSize <= Args->MaxSize ? STATUS_SUCCESS : STATUS_INTERNAL_ERROR;
+ #else
+   auto Args = reinterpret_cast<FEXUnixLib_GetSHMStatsVMA*>(_Args);
+   if (Args->SHMBase == nullptr) {
+@@ -209,6 +240,8 @@ static NTSTATUS FEXUnixLib_GetSHMStatsVMAHandler([[maybe_unused]] void* _Args) {
+ 
+ static NTSTATUS FEXUnixLib_DeleteSHMStatsFileHandler([[maybe_unused]] void* _Args) {
+ #ifdef __APPLE__
++  const std::string Name = "fex-" + std::to_string(getpid()) + "-stats";
++  shm_unlink(Name.c_str());
+   return STATUS_SUCCESS;
+ #else
+   const std::string Name = "fex-" + std::to_string(getpid()) + "-stats";
+-- 
+2.54.0 (Apple Git-157)
+
