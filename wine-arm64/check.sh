@@ -39,13 +39,13 @@ export WINEMSYNC=1
 # NEEDS_FEX: the x64 steps, which run after `fex` registers FEX in that prefix (else Wine's stub xtajit64 runs them).
 # NEEDS_DXMT: the steps that run DXMT, after `dxmt` puts its front ends in that prefix.
 G1="g1-hello g1-seh g1-threads g1-kuser g1-smc g1-tsc g1-unaligned"
-STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake"
+STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset"
 STEPS="$STEPS g5-jit"
 STEPS="$STEPS fonts-tls steam-bridge dxmt dxmt-present dxmt-arm64ec dxmt-x64 g4-bench"
 NEEDS_DXMT="dxmt-present dxmt-arm64ec dxmt-x64"
-NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake g5-jit fonts-tls steam-bridge"
+NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset g5-jit fonts-tls steam-bridge"
 NEEDS_PREFIX="$NEEDS_PREFIX dxmt $NEEDS_DXMT g4-bench"
-NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake g5-jit steam-bridge $NEEDS_DXMT g4-bench"
+NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset g5-jit steam-bridge $NEEDS_DXMT g4-bench"
 
 # The processes running the runtime's executables. Wine rewrites argv, so `pkill -f <path>` finds nothing; the kernel
 # knows the executable. The Rosetta tool folders' (the launcher, Wine and its server): g4-bench's, and the reference's
@@ -232,6 +232,7 @@ waitaddr_cmd() { exe_cmd arm64ec-waitaddr && exe_cmd x64-waitaddr; }
 
 # A wake while the contending threads are suspended returns (patch 25): ARM64EC native and under FEX, 300 rounds each.
 suspendwake_cmd() { exe_cmd arm64ec-suspendwake 300 && exe_cmd x64-suspendwake 300; }
+timerreset_cmd() { exe_cmd arm64ec-timerreset && exe_cmd x64-timerreset; }
 
 # Gate G1's hello: x64 code under FEX, with the exception and DLL-load traces in $WORK/x64-hello.err.
 g1_hello_cmd() {
@@ -623,6 +624,7 @@ run_step() {
     futexterm) step futexterm 60 futexterm_cmd ;;
     waitaddr) step waitaddr 120 waitaddr_cmd ;;
     suspendwake) step suspendwake 180 suspendwake_cmd ;;
+    timerreset) step timerreset 120 timerreset_cmd ;;
     g5-jit) step g5-jit 600 g5_jit_cmd; grep '^info ' "$WORK/g5-jit.log" ;;
     fonts-tls) step fonts-tls 60 fonts_tls_cmd ;;
     steam-bridge) step steam-bridge 300 steam_bridge_cmd; grep '^info ' "$WORK/steam-bridge.log" ;;

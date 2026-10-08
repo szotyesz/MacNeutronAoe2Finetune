@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 03:26:49 +0200
+Subject: [PATCH] server: Never expire a relative timeout too far off to
+ convert.
+
+timeout_to_abstime() turned a relative timeout into a negative abstime
+by subtracting monotonic_time, which overflows for timeouts within the
+current uptime of -0x7fffffffffffffff. Signed overflow is undefined;
+clang on macOS compiles the result into an expiry in the past, so a
+timer set that far off fired at once.
+
+ntdll's threadpool sets its relative timer exactly that far off when
+timers exist but none is pending (update_timers() with an empty
+relative queue). Its timer thread then woke at once, set both timers
+again and waited again, forever: about 9,000 rounds and 19,000
+set_timer requests a second for the whole life of the process, a
+wineserver busy with them, and every other request queued behind them.
+Age of Empires II: Definitive Edition, which creates threadpool timers
+early, started up that way (aoe2 fork, finding N3-F6).
+
+Saturate such timeouts to the farthest relative abstime, and use the
+helper in set_timer() too. Reproducer: wine-arm64/tests/
+arm64ec-timerreset.c, a relative due time of the uptime minus
+0x7fffffffffffffff, and an idle process with a threadpool timer.
+---
+ server/file.h  | 6 +++++-
+ server/timer.c | 2 +-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/server/file.h b/server/file.h
+index 61f570f..c682ff7 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -138,7 +138,11 @@ typedef void (*timeout_callback)( void *private );
+ 
+ static inline abstime_t timeout_to_abstime( timeout_t timeout )
+ {
+-    return timeout > 0 ? timeout : timeout - monotonic_time;
++    if (timeout > 0) return timeout;
++    /* A relative timeout too far off for an abstime never expires. Computing it would overflow, which the compiler
++     * is free to turn into an expiry in the past: a timer set that far off would fire at once. */
++    if (timeout < monotonic_time - TIMEOUT_INFINITE) return -TIMEOUT_INFINITE;
++    return timeout - monotonic_time;
+ }
+ 
+ static inline timeout_t abstime_to_timeout( abstime_t abstime )
+diff --git a/server/timer.c b/server/timer.c
+index d6be55c..4055045 100644
+--- a/server/timer.c
++++ b/server/timer.c
+@@ -152,7 +152,7 @@ static int set_timer( struct timer *timer, timeout_t expire, unsigned int period
+         timer->signaled = 0;
+         reset_sync( timer->sync );
+     }
+-    timer->when     = (expire <= 0) ? expire - monotonic_time : max( expire, current_time );
++    timer->when     = (expire <= 0) ? timeout_to_abstime( expire ) : max( expire, current_time );
+     timer->period   = period;
+     timer->callback = callback;
+     timer->arg      = arg;
+-- 
+2.54.0 (Apple Git-157)
+
