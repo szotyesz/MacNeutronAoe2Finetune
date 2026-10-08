@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Szabo <szotyesz@Mac.home>
+Date: Thu, 8 Oct 2026 13:31:51 +0200
+Subject: [PATCH] Windows: Don't re-enter the code invalidation from a block's
+ self-check.
+
+A self-checked block whose bytes changed calls ThreadRemoveCodeEntry
+from JIT code, which reaches InvalidateGuestCodeRange with the
+frontend's callbacks enabled. The invalidation holds
+CodeInvalidationMutex while it zeroes each thread's call-ret stack
+(VirtualDontNeed: a decommit, then a commit). Wine's ARM64EC
+NtFreeVirtualMemory told FEX about that decommit, and
+NotifyMemoryFree's own invalidation then waited forever on the mutex
+the thread already held, with ThreadCreationMutex taken as well, so
+every new thread blocked in ThreadInit. Age of Empires II: Definitive
+Edition with any mod enabled sat behind a black window after its
+setup.
+
+Disable the callbacks for the call, as ResetToConsistentState does,
+and walk Threads under ThreadCreationMutex, as the frontend's other
+invalidations do. Reproducer: MacNeutron's
+wine-arm64/tests/x64-smcspeed.c, whose rewrite without
+FlushInstructionCache hung before.
+
+Downstream MacNeutron patch, not for upstream FEX, which does not
+accept AI-generated code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/ARM64EC/Module.cpp | 38 ++++++++++++++++++-------------
+ 1 file changed, 22 insertions(+), 16 deletions(-)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 1c02215..9f33e32 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -159,6 +159,22 @@ ThreadCPUArea GetCPUArea() {
+   return ThreadCPUArea(NtCurrentTeb());
+ }
+ 
++class ScopedCallbackDisable {
++private:
++  bool Prev;
++
++public:
++  ScopedCallbackDisable() {
++    const auto CPUArea = GetCPUArea();
++    Prev = CPUArea.Area->InSyscallCallback;
++    CPUArea.Area->InSyscallCallback = true;
++  }
++
++  ~ScopedCallbackDisable() {
++    GetCPUArea().Area->InSyscallCallback = Prev;
++  }
++};
++
+ FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
+   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+ }
+@@ -543,6 +559,12 @@ public:
+   }
+ 
+   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
++    // MacNeutron (downstream only, not for upstream FEX): JIT code calls this (ThreadRemoveCodeEntry, a block whose
++    // bytes changed) with callbacks enabled. Freeing FEX's own memory during the invalidation (the call-ret stack's
++    // VirtualDontNeed) then notified FEX, which re-entered the invalidation and waited forever on the
++    // CodeInvalidationMutex this thread held. Threads is walked under ThreadCreationMutex, as by the other callers.
++    ScopedCallbackDisable Guard;
++    std::scoped_lock Lock(ThreadCreationMutex);
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+   }
+ 
+@@ -656,22 +678,6 @@ NTSTATUS ProcessInit() {
+ 
+ void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+ 
+-class ScopedCallbackDisable {
+-private:
+-  bool Prev;
+-
+-public:
+-  ScopedCallbackDisable() {
+-    const auto CPUArea = GetCPUArea();
+-    Prev = CPUArea.Area->InSyscallCallback;
+-    CPUArea.Area->InSyscallCallback = true;
+-  }
+-
+-  ~ScopedCallbackDisable() {
+-    GetCPUArea().Area->InSyscallCallback = Prev;
+-  }
+-};
+-
+ // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+   auto Thread = CPUArea.ThreadState();
+-- 
+2.54.0 (Apple Git-157)
+

@@ -2,7 +2,9 @@
 // instruction x64 loop runs on an execute-only page, and on an RWX page written to while it holds compiled code until
 // FEX stops trapping writes to it (MACNEUTRON_SMC_SELFCHECK writes; FEX's default 16), so its blocks check their own
 // bytes. Prints both times per loop iteration and their ratio; also checks that a rewrite of the self-checked code
-// takes effect (the loop's multiplier changes from 3 to 5).
+// takes effect (the loop's multiplier changes from 3 to 5), and that one without FlushInstructionCache does too, as x86
+// code may rely on: only the block's own check catches it, and its invalidation must not re-enter FEX's memory hooks
+// when it frees FEX's own memory (that deadlocked the thread).
 // Usage: x64-smcspeed.exe [iterations]   Prints "PASS x64-smcspeed" and "row <case> <ns per iteration>" lines.
 #include <windows.h>
 #include <stdio.h>
@@ -66,6 +68,8 @@ int main(int argc, char **argv) {
   rwx[6] = 0x05;
   FlushInstructionCache(GetCurrentProcess(), rwx, 0x1000);
   if (((loop_fn)rwx)(1000) != reference(1000, 5)) { printf("FAIL: the rewrite did not take effect\n"); fails++; }
+  rwx[6] = 0x03;
+  if (((loop_fn)rwx)(1000) != reference(1000, 3)) { printf("FAIL: the rewrite without a flush did not take effect\n"); fails++; }
 
   if (fails) { printf("FAIL x64-smcspeed (%d)\n", fails); return 1; }
   printf("PASS x64-smcspeed\n");
