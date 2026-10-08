@@ -122,6 +122,11 @@ WA_FLAGS_arm64-x18path = -lntdll
 WA_FLAGS_arm64ec-futexterm = -lsynchronization
 WA_FLAGS_arm64ec-waitaddr = -lsynchronization
 WA_FLAGS_arm64ec-suspendwake = -lsynchronization
+WA_FLAGS_arm64ec-d3d11a8 = -ld3d11 -ldxguid -luuid
+WA_FLAGS_arm64ec-d3d11lod = -ld3d11 -ldxguid -luuid
+WA_FLAGS_arm64ec-d3d11packed = -ld3d11 -ldxguid -luuid
+WA_FLAGS_arm64ec-d3d11ramp = -ld3d11 -ldxguid -luuid
+WA_FLAGS_arm64ec-d3d11upload = -ld3d11 -ldxguid -luuid
 wine-arm64-tests:
 	mkdir -p build/wine-arm64-tests
 	$(MAKE) -s -j$(shell sysctl -n hw.ncpu) $(WA_TESTS) build/wine-arm64-tests/x64-x18path.exe \

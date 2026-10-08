@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Szabo <szotyesz@Mac.home>
+Date: Thu, 8 Oct 2026 03:49:58 +0200
+Subject: [PATCH] airconv: Link varyings by register, as D3D does.
+
+A varying was named after its signature element's register and first
+component (reg1_0, reg1_2), so stages only linked when they split a
+register into the same elements. D3D links by register. Age of Empires
+II: Definitive Edition's menu text vertex shader writes TEXCOORD0 to
+o1.xy and TEXCOORD1 to o1.zw; its gradient text pixel shader reads
+TEXCOORD0 as v1.xyzw. Linked to reg1_0 alone, the pixel shader saw
+zeros in v1.zw, the glyph atlas coordinate, and the menus' text came
+out in fragments (aoe2 fork, finding G-TEXT). The other way round, a
+pixel shader reading two halves of one float4 output, the pipeline
+failed to build: "Fragment input(s) user(reg1_2) ... not written by
+vertex shader".
+
+Name a varying after its register alone. A vertex or mesh output writes
+the whole register once, whichever of its elements a declaration names,
+and a pixel shader's declarations of one register read one input.
+Reproducer: wine-arm64/tests/arm64ec-d3d11packed.c in the MacNeutron
+tree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/airconv/dxbc_converter.hpp |  7 ++++++-
+ src/airconv/dxbc_signature.cpp | 11 ++++++++---
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/src/airconv/dxbc_converter.hpp b/src/airconv/dxbc_converter.hpp
+index 3e4877c..c007327 100644
+--- a/src/airconv/dxbc_converter.hpp
++++ b/src/airconv/dxbc_converter.hpp
+@@ -3,6 +3,7 @@
+ #include <cstdint>
+ #include <map>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <unordered_map>
+ #include <variant>
+@@ -389,8 +390,10 @@ public:
+     return semantic_name_ + std::to_string(semantic_index_);
+   }
+ 
++  /* MacNeutron: one varying per register, as D3D links stages by register: a register holding several elements (o1.xy
++   * and o1.zw) is read whole by a stage that declares it as one (v1.xyzw), and the other way round. */
+   std::string consistentAttributeName() const {
+-    return "reg" + std::to_string(register_) + "_" + std::to_string(std::countr_zero(mask_ & 0xFu));
++    return "reg" + std::to_string(register_);
+   }
+ 
+   uint32_t stream() const { return stream_; }
+@@ -446,6 +449,8 @@ public:
+   microsoft::D3D10_SB_PRIMITIVE gs_input_primitive = {};
+   std::vector<std::function<IREffect(MeshOutputContext &)>> mesh_output_handlers;
+   uint32_t num_mesh_vertex_data = 0;
++  /* MacNeutron: the output registers that have their mesh vertex data, the varying's whole register */
++  std::set<uint32_t> mesh_vertex_data_regs;
+   microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY gs_output_topology = {};
+   uint32_t gs_max_vertex_output = 0;
+   uint32_t gs_instance_count = 1;
+diff --git a/src/airconv/dxbc_signature.cpp b/src/airconv/dxbc_signature.cpp
+index 72d67f9..2b5973d 100644
+--- a/src/airconv/dxbc_signature.cpp
++++ b/src/airconv/dxbc_signature.cpp
+@@ -261,7 +261,8 @@ void handle_signature_vs(
+       signature_handlers.push_back([=](SignatureContext &ctx) {
+         if (ctx.skip_vertex_output)
+           return;
+-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
++        // MacNeutron: the whole register, whichever of its elements this declaration names (one varying per register)
++        ctx.epilogue >> pop_output_reg(reg, 0xF, assigned_index);
+       });
+       break;
+     }
+@@ -953,6 +954,8 @@ void handle_signature_ds(
+       });
+       max_output_register = std::max(reg + 1, max_output_register);
+       if (sig.mask() == 0) break;
++      // MacNeutron: one varying per register; a second element in the register is in it already
++      if (!sm50_shader->mesh_vertex_data_regs.insert(reg).second) break;
+       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
+       auto const type = to_msl_type(sig.componentType());
+       func_signature.DefineMeshVertexOutput(OutputMeshData{
+@@ -961,7 +964,7 @@ void handle_signature_ds(
+         .index = mesh_vertex_data_index
+       });
+       mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
+-        return pop_mesh_output_vertex_data(reg, mask, mesh_vertex_data_index, output.vertex_id, type);
++        return pop_mesh_output_vertex_data(reg, 0xF, mesh_vertex_data_index, output.vertex_id, type);
+       });
+       break;
+     }
+@@ -1185,6 +1188,8 @@ handle_signature_gs(
+       });
+       max_output_register = std::max(reg + 1, max_output_register);
+       if (sig.mask() == 0) break;
++      // MacNeutron: one varying per register; a second element in the register is in it already
++      if (!sm50_shader->mesh_vertex_data_regs.insert(reg).second) break;
+       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
+       auto const type = to_msl_type(sig.componentType());
+       func_signature.DefineMeshVertexOutput(OutputMeshData{
+@@ -1193,7 +1198,7 @@ handle_signature_gs(
+         .index = mesh_vertex_data_index
+       });
+       mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
+-        return pop_mesh_output_vertex_data(reg, mask, mesh_vertex_data_index, output.vertex_id, type);
++        return pop_mesh_output_vertex_data(reg, 0xF, mesh_vertex_data_index, output.vertex_id, type);
+       });
+       break;
+     }
+-- 
+2.54.0 (Apple Git-157)
+
