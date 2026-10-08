@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 23:59:02 +0200
+Subject: [PATCH] ntdll: Wait on addresses in the kernel's queues on macOS.
+
+RtlWaitOnAddress() kept its waiters in user-memory queues behind one
+spinlock per hash bucket. A thread suspended inside that spinlock kept
+it held, so the next wake on the bucket spun forever; so did a wake
+that read a queue entry whose memory was gone, once FEX's exception
+handler re-entered the queue from the access violation. Age of Empires
+II: Definitive Edition's hang reporter suspends every other thread and
+then runs FEX code that releases its mutexes: the game froze on its
+splash screen (aoe2 fork, finding N3-F5).
+
+On macOS 14.4, waits now go to os_sync_wait_on_address() through two
+new unix calls, so a waiter leaves nothing in user memory and takes no
+lock. 1- and 2-byte waits (SRW locks' exclusive waiters) wait on the
+aligned 4-byte word holding them; a single wake on a word such waiters
+may share wakes them all, which WaitOnAddress allows as spurious
+wakeups. Per-bucket waiter counts let a wake with no possible waiter
+skip the system call. The futex queues remain for what the kernel
+refuses and for 32-bit callers. Reproducer:
+wine-arm64/tests/arm64ec-suspendwake.c (hung on round 3 and 20 before,
+passes 300 rounds after); semantics: arm64ec-waitaddr.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/sync.c              | 106 +++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/loader.c       |   7 +++
+ dlls/ntdll/unix/sync.c         |  77 ++++++++++++++++++++++++
+ dlls/ntdll/unix/unix_private.h |   2 +
+ dlls/ntdll/unixlib.h           |  17 ++++++
+ 5 files changed, 209 insertions(+)
+
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 3a4470a..67765a4 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -844,6 +844,96 @@ static struct futex_queue *get_futex_queue( const void *addr )
+     return &futex_queues[(val >> 4) % ARRAY_SIZE(futex_queues)];
+ }
+ 
++/* Waits go to the kernel's address wait queues (the unix wait_on_address), where a waiter leaves nothing in user
++ * memory and takes no lock: a thread suspended, terminated or re-entered from an exception handler cannot block
++ * another thread's wait or wake. The kernel waits on 4- and 8-byte values; a 1- or 2-byte wait waits on the aligned
++ * 4-byte word that holds it, so any change to that word wakes it (a spurious wakeup when another part changed). A
++ * single wake on a word such sub-word waiters may share wakes all of its waiters, since the kernel cannot tell which
++ * of them it was meant for. The futex queues serve what the kernel refuses (a value across a word boundary, an
++ * address waited on with another size); a wake looks at them only while they have waiters.
++ * kernel_waiters counts the kernel waiters by size and by the futex queues' hash of the kernel address, sub_waiters
++ * the sub-word ones among the 4-byte waiters: a wake on an address nobody can be waiting on makes no system call. */
++static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size );
++
++static BOOL kernel_waits = TRUE;
++static LONG queue_waiters;
++static LONG kernel_waiters[2][ARRAY_SIZE(futex_queues)];  /* 4- and 8-byte kernel waits */
++static LONG sub_waiters[ARRAY_SIZE(futex_queues)];
++
++static unsigned int kernel_bucket( const void *addr )
++{
++    return get_futex_queue( addr ) - futex_queues;
++}
++
++static void kernel_wake( const void *addr, ULONG sizes, BOOL all )
++{
++    struct wake_address_params params = { addr, sizes, all };
++
++    if (WINE_UNIX_CALL( unix_wake_address, &params ) == STATUS_NOT_SUPPORTED) kernel_waits = FALSE;
++}
++
++/* Wakes the kernel waiters that may be waiting for a change at addr: those on addr itself, and the sub-word ones on
++ * the 4-byte word holding addr. */
++static void wake_kernel_waiters( const void *addr, BOOL all )
++{
++    unsigned int bucket = kernel_bucket( addr );
++    ULONG sizes = 0;
++
++    MemoryBarrier();  /* the caller's store to *addr, before the waiter counts are read */
++    if (!kernel_waits) return;
++    if (ReadNoFence( &kernel_waiters[0][bucket] )) sizes |= 4;
++    if (ReadNoFence( &kernel_waiters[1][bucket] )) sizes |= 8;
++    if (sizes) kernel_wake( addr, sizes, all || ReadNoFence( &sub_waiters[bucket] ));
++    if ((ULONG_PTR)addr & 3)
++    {
++        const void *word = (const void *)((ULONG_PTR)addr & ~(ULONG_PTR)3);
++
++        if (ReadNoFence( &sub_waiters[kernel_bucket( word )] )) kernel_wake( word, 4, TRUE );
++    }
++}
++
++/* RtlWaitOnAddress() in the kernel; STATUS_INVALID_PARAMETER when the futex queues have to take it. */
++static NTSTATUS kernel_wait( const void *addr, const void *cmp, SIZE_T size, const LARGE_INTEGER *timeout )
++{
++    struct wait_on_address_params params = { addr, 0, size, timeout };
++    unsigned int bucket;
++    BOOL sub = FALSE;
++    NTSTATUS ret;
++
++    if (size == 4 || size == 8)
++    {
++        if (!compare_addr( addr, cmp, size )) return STATUS_SUCCESS;
++        params.value = size == 4 ? *(const ULONG *)cmp : *(const ULONG64 *)cmp;
++    }
++    else
++    {
++        ULONG_PTR offset = (ULONG_PTR)addr & 3;
++        ULONG word, mask = size == 1 ? 0xff : 0xffff;
++
++        if (offset + size > 4) return STATUS_INVALID_PARAMETER;
++        params.addr = (const void *)((ULONG_PTR)addr - offset);
++        params.size = 4;
++        word = ReadNoFence( (const LONG *)params.addr );
++        if (((word >> (offset * 8)) & mask) != (size == 1 ? *(const UCHAR *)cmp : *(const USHORT *)cmp))
++            return STATUS_SUCCESS;
++        params.value = word;
++        sub = TRUE;
++    }
++
++    bucket = kernel_bucket( params.addr );
++    InterlockedIncrement( &kernel_waiters[params.size == 8][bucket] );
++    if (sub) InterlockedIncrement( &sub_waiters[bucket] );
++    ret = WINE_UNIX_CALL( unix_wait_on_address, &params );
++    if (sub) InterlockedDecrement( &sub_waiters[bucket] );
++    InterlockedDecrement( &kernel_waiters[params.size == 8][bucket] );
++    if (ret == STATUS_NOT_SUPPORTED)
++    {
++        kernel_waits = FALSE;
++        return STATUS_INVALID_PARAMETER;
++    }
++    return ret;
++}
++
+ /* The lock holds its owner's thread ID, so futex_forget_thread() can tell a thread stopped inside it. */
+ static void spin_lock( LONG *lock )
+ {
+@@ -888,9 +978,16 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     if (size != 1 && size != 2 && size != 4 && size != 8)
+         return STATUS_INVALID_PARAMETER;
+ 
++    if (kernel_waits && (ret = kernel_wait( addr, cmp, size, timeout )) != STATUS_INVALID_PARAMETER)
++    {
++        TRACE("returning %#lx\n", ret);
++        return ret;
++    }
++
+     entry.addr = addr;
+     entry.tid = GetCurrentThreadId();
+ 
++    InterlockedIncrement( &queue_waiters );
+     spin_lock( &queue->lock );
+ 
+     /* Do the comparison inside of the spinlock, to reduce spurious wakeups. */
+@@ -898,6 +995,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     if (!compare_addr( addr, cmp, size ))
+     {
+         spin_unlock( &queue->lock );
++        InterlockedDecrement( &queue_waiters );
+         return STATUS_SUCCESS;
+     }
+ 
+@@ -917,6 +1015,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+             list_remove( &entry.entry );
+         spin_unlock( &queue->lock );
+     }
++    InterlockedDecrement( &queue_waiters );
+ 
+     TRACE("returning %#lx\n", ret);
+ 
+@@ -938,6 +1037,9 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+ 
+     if (!addr) return;
+ 
++    wake_kernel_waiters( addr, TRUE );
++    if (!ReadNoFence( &queue_waiters )) return;
++
+     spin_lock( &queue->lock );
+ 
+     if (!queue->queue.next)
+@@ -1018,6 +1120,7 @@ void futex_forget_thread( HANDLE thread, DWORD tid )
+                 if (entry->tid != tid) continue;
+                 entry->addr = NULL;
+                 list_remove( &entry->entry );
++                InterlockedDecrement( &queue_waiters );  /* the dead thread will not */
+             }
+         }
+         spin_unlock( &queue->lock );
+@@ -1037,6 +1140,9 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+ 
+     if (!addr) return;
+ 
++    wake_kernel_waiters( addr, FALSE );
++    if (!ReadNoFence( &queue_waiters )) return;
++
+     spin_lock( &queue->lock );
+ 
+     if (!queue->queue.next)
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 45b0d6d..e476231 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1078,6 +1078,8 @@ static const unixlib_entry_t unix_call_funcs[] =
+     unixcall_wine_server_handle_to_fd,
+     unixcall_wine_spawnvp,
+     system_time_precise,
++    wait_on_address,
++    wake_address,
+ };
+ 
+ 
+@@ -1085,6 +1087,9 @@ static const unixlib_entry_t unix_call_funcs[] =
+ 
+ static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
+ static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
++/* 32-bit callers keep ntdll's futex queues: no 32-bit layout of the parameters is converted here. */
++static NTSTATUS wow64_wait_on_address( void *args ) { return STATUS_NOT_SUPPORTED; }
++static NTSTATUS wow64_wake_address( void *args ) { return STATUS_NOT_SUPPORTED; }
+ 
+ const unixlib_entry_t unix_call_wow64_funcs[] =
+ {
+@@ -1096,6 +1101,8 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
+     wow64_wine_server_handle_to_fd,
+     wow64_wine_spawnvp,
+     system_time_precise,
++    wow64_wait_on_address,
++    wow64_wake_address,
+ };
+ 
+ #endif  /* _WIN64 */
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 0e9191c..52d9bb2 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -3650,6 +3650,83 @@ static LONGLONG update_timeout( ULONGLONG end )
+ #endif
+ 
+ 
++/***********************************************************************
++ *           wait_on_address  (unix call)
++ *
++ * RtlWaitOnAddress() for a 4- or 8-byte value, in the kernel's address wait queues (os_sync_wait_on_address,
++ * macOS 14.4). The waiter leaves nothing in user memory: a thread suspended, terminated or re-entered from an
++ * exception handler holds no lock and leaves no queue entry that another thread could block on or read after it is
++ * freed. The caller has checked the value. Returns STATUS_INVALID_PARAMETER when the kernel refuses the address
++ * (misaligned, or waited on with another size), STATUS_NOT_SUPPORTED without the API: the caller then uses its queues.
++ */
++NTSTATUS wait_on_address( void *args )
++{
++#ifdef MAC_OS_VERSION_14_4
++    const struct wait_on_address_params *params = args;
++
++    if (__builtin_available( macOS 14.4, * ))
++    {
++        int ret;
++
++        if (params->timeout && params->timeout->QuadPart != TIMEOUT_INFINITE)
++        {
++            LONGLONG left = update_timeout( get_absolute_timeout( params->timeout ) );
++
++            if (!left) return STATUS_TIMEOUT;
++            if (left < (LONGLONG)(UINT64_MAX / 100))
++                ret = os_sync_wait_on_address_with_timeout( (void *)params->addr, params->value, params->size,
++                                                            OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME,
++                                                            (uint64_t)left * 100 );
++            else
++                ret = os_sync_wait_on_address( (void *)params->addr, params->value, params->size,
++                                               OS_SYNC_WAIT_ON_ADDRESS_NONE );
++        }
++        else ret = os_sync_wait_on_address( (void *)params->addr, params->value, params->size,
++                                            OS_SYNC_WAIT_ON_ADDRESS_NONE );
++
++        if (ret >= 0) return STATUS_SUCCESS;
++        if (errno == ETIMEDOUT) return STATUS_TIMEOUT;
++        if (errno == EINVAL) return STATUS_INVALID_PARAMETER;
++        return STATUS_SUCCESS;  /* EINTR, EFAULT, ENOMEM: a spurious wakeup; the caller checks the value again */
++    }
++#endif
++    return STATUS_NOT_SUPPORTED;
++}
++
++
++/***********************************************************************
++ *           wake_address  (unix call)
++ *
++ * Wakes one or all of wait_on_address()'s waiters on an address, for each size the caller says may be waited with
++ * there (the kernel matches a wake to its waiters' size).
++ */
++NTSTATUS wake_address( void *args )
++{
++#ifdef MAC_OS_VERSION_14_4
++    const struct wake_address_params *params = args;
++
++    if (__builtin_available( macOS 14.4, * ))
++    {
++        size_t size;
++
++        for (size = 4; size <= 8; size += 4)
++        {
++            int ret;
++
++            if (!(params->sizes & size) || (ULONG_PTR)params->addr % size) continue;
++            if (params->all)
++                ret = os_sync_wake_by_address_all( (void *)params->addr, size, OS_SYNC_WAKE_BY_ADDRESS_NONE );
++            else
++                ret = os_sync_wake_by_address_any( (void *)params->addr, size, OS_SYNC_WAKE_BY_ADDRESS_NONE );
++            if (ret >= 0 && !params->all) break;  /* one waiter woken */
++        }
++        return STATUS_SUCCESS;
++    }
++#endif
++    return STATUS_NOT_SUPPORTED;
++}
++
++
+ /***********************************************************************
+  *             NtWaitForAlertByThreadId (NTDLL.@)
+  */
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 9b6401e..8bcbe02 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -302,6 +302,8 @@ extern NTSTATUS get_thread_context( HANDLE handle, void *context, BOOL *self, US
+ extern unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
+                                              data_size_t *ret_len );
+ extern NTSTATUS system_time_precise( void *args );
++extern NTSTATUS wait_on_address( void *args );
++extern NTSTATUS wake_address( void *args );
+ 
+ extern void *anon_mmap_fixed( void *start, size_t size, int prot, int flags );
+ extern void *anon_mmap_alloc( size_t size, int prot );
+diff --git a/dlls/ntdll/unixlib.h b/dlls/ntdll/unixlib.h
+index 9cb4443..47eefb8 100644
+--- a/dlls/ntdll/unixlib.h
++++ b/dlls/ntdll/unixlib.h
+@@ -66,6 +66,21 @@ struct unwind_builtin_dll_params
+     CONTEXT                    *context;
+ };
+ 
++struct wait_on_address_params
++{
++    const void          *addr;
++    ULONG64              value;
++    SIZE_T               size;
++    const LARGE_INTEGER *timeout;
++};
++
++struct wake_address_params
++{
++    const void          *addr;
++    ULONG                sizes;  /* 4 | 8: the sizes waited with */
++    BOOL                 all;
++};
++
+ enum ntdll_unix_funcs
+ {
+     unix_load_so_dll,
+@@ -76,6 +91,8 @@ enum ntdll_unix_funcs
+     unix_wine_server_handle_to_fd,
+     unix_wine_spawnvp,
+     unix_system_time_precise,
++    unix_wait_on_address,
++    unix_wake_address,
+ };
+ 
+ extern unixlib_handle_t __wine_unixlib_handle;
+-- 
+2.54.0 (Apple Git-157)
+
