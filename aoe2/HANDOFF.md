@@ -174,7 +174,18 @@ filled the disk once. Use it only for short runs, or filter (`warn+seh`, or a na
      (`n3.md`).
    - The Xbox sign-in and the free "Enhanced Graphics Pack" DLC prompt.
 
-## 4. Not in git
+## 4. To do: from hand testing with no mods (user, 2026-10-08)
+
+Not investigated yet.
+1. **1920x1080 in the middle of the screen.** Can the game run at 1920x1080, scaled to fit, centred, with black bars
+   above and below (as the main menu looks now)?
+2. **A tick every ~5 s in gameplay.** Everything freezes for a moment, audio too. Is macOS Game Mode on when it
+   starts?
+3. **Other renderers than DXMT?** The rendering problems are still there, and the game feels a little sluggish.
+4. **Integrate CaptureAge.** On Linux this works through a wrapper exe that starts both AoE2DE and CaptureAge, so they
+   run in the same environment (the same Proton prefix and session) and can share resources. Do the same here.
+
+## 5. Not in git
 
 These stay out of the repository on purpose. Copy them to the SSD if they are wanted.
 - `$AOE2_WORK_ROOT` (on the old machine `~/aoe2-poc-work`): run logs, screenshots, process samples and `results.json`
