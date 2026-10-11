@@ -73,7 +73,7 @@ func winebootCreatingPrefix(status: Int32 = 0, delay: TimeInterval = 0) -> FakeR
 }
 
 /// A tool folder with a fake, unsigned `wine.app`: executable wine/wineserver, DXMT's DLLs, version and replayer,
-/// both halves of lsteamclient, and `CFBundleShortVersionString` `test`. Tests that launch inject the identity.
+/// DXVK's DLLs, version and Vulkan driver manifest, both halves of lsteamclient, and `CFBundleShortVersionString` `test`. Tests that launch inject the identity.
 func makeToolLayout() throws -> ToolLayout {
     let layout = ToolLayout(root: try makeTempDir().appending(path: "macneutron", directoryHint: .isDirectory))
     try write("#!/bin/sh\n", to: layout.wine, executable: true)
@@ -84,6 +84,9 @@ func makeToolLayout() throws -> ToolLayout {
     for dll in ToolLayout.dxmtDLLs { try write("dxmt \(dll)", to: layout.dxmt.appending(path: dll)) }
     try write("dxmt replay", to: layout.dxmtReplay)
     try write("dxmt-test\n", to: layout.dxmtVersionFile)
+    for dll in ToolLayout.dxvkDLLs { try write("dxvk \(dll)", to: layout.dxvk.appending(path: dll)) }
+    try write("dxvk-test\n", to: layout.dxvkVersionFile)
+    try write("{}\n", to: layout.vulkanDriverManifest)
     try write("lsteamclient aarch64", to: layout.lsteamclient)
     try write("lsteamclient.so", to: layout.lsteamclientUnix)
     return layout

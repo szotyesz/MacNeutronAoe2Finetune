@@ -62,8 +62,12 @@ public struct Launcher: Sendable {
             return 0
         }
 
-        let (backend, note) = GraphicsBackend.select(requested: environment["MACNEUTRON_GRAPHICS"])
+        let (backend, note) = GraphicsBackend.select(requested: environment["MACNEUTRON_GRAPHICS"], appID: context.appID)
         var env = LaunchEnvironment.build(base: environment, context: context, backend: backend, logging: logging)
+        // DXVK's Vulkan is the runtime's KosmicKrisp alone, whatever other drivers the Mac has installed.
+        if backend == .dxvk, env["VK_DRIVER_FILES"] == nil, env["VK_ICD_FILENAMES"] == nil {
+            env["VK_DRIVER_FILES"] = layout.vulkanDriverManifest.path(percentEncoded: false)
+        }
         let steamBridge = usesSteamBridge(request.verb, env)
         if steamBridge { addSteamClient(to: &env) }
         // The MetalFX presenter inside wine.app reads this; only the game's verbs ask for it.
@@ -141,7 +145,8 @@ public struct Launcher: Sendable {
         guard let context = try? CompatContext(environment: environment) else { return }
         let merged = (try? withSettings(environment, appID: context.appID)) ?? environment
         let env = LaunchEnvironment.build(base: merged, context: context,
-                                          backend: GraphicsBackend.select(requested: merged["MACNEUTRON_GRAPHICS"]).backend,
+                                          backend: GraphicsBackend.select(requested: merged["MACNEUTRON_GRAPHICS"],
+                                                                          appID: context.appID).backend,
                                           logging: false)
         _ = try? runner.run(layout.wineserver, ["-k"], environment: env, output: nil)
     }

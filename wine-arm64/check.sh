@@ -41,11 +41,11 @@ export WINEMSYNC=1
 G1="g1-hello g1-seh g1-threads g1-kuser g1-smc g1-tsc g1-unaligned"
 STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset exportstubs"
 STEPS="$STEPS g5-jit"
-STEPS="$STEPS fonts-tls steam-bridge dxmt dxmt-present dxmt-arm64ec dxmt-x64 g4-bench"
+STEPS="$STEPS fonts-tls steam-bridge dxmt dxvk dxmt-present dxmt-arm64ec dxmt-x64 g4-bench"
 NEEDS_DXMT="dxmt-present dxmt-arm64ec dxmt-x64"
 NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset exportstubs g5-jit fonts-tls steam-bridge"
-NEEDS_PREFIX="$NEEDS_PREFIX dxmt $NEEDS_DXMT g4-bench"
-NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset exportstubs g5-jit steam-bridge $NEEDS_DXMT g4-bench"
+NEEDS_PREFIX="$NEEDS_PREFIX dxmt dxvk $NEEDS_DXMT g4-bench"
+NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset exportstubs g5-jit steam-bridge dxvk $NEEDS_DXMT g4-bench"
 
 # The processes running the runtime's executables. Wine rewrites argv, so `pkill -f <path>` finds nothing; the kernel
 # knows the executable. The Rosetta tool folders' (the launcher, Wine and its server): g4-bench's, and the reference's
@@ -517,6 +517,35 @@ dxmt_cmd() {
   WINEPREFIX="$PFX" "$TOOL/Contents/Resources/bin/wineserver" -w
 }
 
+# DXVK (aoe2: AoE2DE's renderer): the D3D11 programs, ARM64EC and x64 (x64 code on the ARM64EC DXVK, as the game), each
+# run from a folder that holds DXVK's front ends (Wine loads a native DLL from the program's folder first), on the
+# bundle's KosmicKrisp alone (VK_DRIVER_FILES), as the launcher runs a DXVK game. The programs check the pixels; DXVK's
+# log on stderr (no log files) shows it was DXVK that drew. The prefix's system32 keeps DXMT's.
+dxvk_cmd() {
+  . "$ROOT/wine-arm64/vulkan.pins"  # DXVK_COMMIT
+  d="$TOOL/Contents/Resources/DXVK" dir="$WORK/dxvk"
+  ver=$(cat "$d/version") || return 1
+  case $ver in "$DXVK_COMMIT"|"$DXVK_COMMIT+dev") ;; *) echo "DXVK/version is '$ver', not $DXVK_COMMIT[+dev]"; return 1 ;; esac
+  rm -rf "$dir" && mkdir -p "$dir" && cp "$d/aarch64-windows/"* "$dir/" || return 1
+  n=0
+  for exe in "$TESTS"/arm64ec-d3d11*.exe "$TESTS"/x64-d3d11*.exe; do
+    p=${exe##*/}; p=${p%.exe}
+    cp "$exe" "$dir/" || return 1
+    out=$(WINEDLLOVERRIDES="dxgi,d3d10core,d3d11=n,b;d3d12=b" DXVK_LOG_PATH=none \
+      VK_DRIVER_FILES="$TOOL/Contents/Resources/vulkan/icd.d/kosmickrisp_icd.json" wine_run "$dir/$p.exe" \
+      2> "$WORK/dxvk-$p.err" | tr -d '\r') || true
+    printf '%s\n' "$out" | LC_ALL=C /usr/bin/grep -qx "PASS $p" || { echo "$p on DXVK: ${out:-no output}"; return 1; }
+    LC_ALL=C /usr/bin/grep -q "DXVK: v" "$WORK/dxvk-$p.err" \
+      || { echo "$p passed without DXVK's log: was it DXVK? (see ${WORK#"$ROOT"/}/dxvk-$p.err)"; return 1; }
+    echo "PASS $p on DXVK"
+    n=$((n + 1))
+  done
+  [ "$n" = 10 ] || { echo "ran $n D3D11 programs, not 10 (make wine-arm64-tests)"; return 1; }
+  for w in 'DXVK: v' 'Found device:'; do
+    echo "info $(LC_ALL=C /usr/bin/grep -h -m1 "$w" "$WORK"/dxvk-*.err | head -n 1 | sed 's/^info: *//')"
+  done
+}
+
 # Gate D2's minimum winshot shares (percent of the window's pixels), from Task 4's measurement of the same programs on
 # our DXMT under the Rosetta runtime (dark mode, 1x display): present_loop green 71 white 24, d3d12_clear green 95
 # white 0. Green keeps 15 points of margin, white half the measured share (a light-mode title bar adds about 4 white).
@@ -631,6 +660,7 @@ run_step() {
     fonts-tls) step fonts-tls 60 fonts_tls_cmd ;;
     steam-bridge) step steam-bridge 300 steam_bridge_cmd; grep '^info ' "$WORK/steam-bridge.log" ;;
     dxmt) step dxmt 120 dxmt_cmd ;;
+    dxvk) step dxvk 600 dxvk_cmd; grep '^info ' "$WORK/dxvk.log" ;;
     dxmt-present) step dxmt-present 600 dxmt_present_cmd; grep '^info ' "$WORK/dxmt-present.log" ;;
     dxmt-arm64ec) step dxmt-arm64ec 3600 dxmt_lane_cmd arm64ec ARM64EC "$B/dxmt-tests-arm64ec" \
       "$B/dxmt-tests-arm64ec/present_loop.exe"; grep '^info ' "$WORK/dxmt-arm64ec.log" ;;

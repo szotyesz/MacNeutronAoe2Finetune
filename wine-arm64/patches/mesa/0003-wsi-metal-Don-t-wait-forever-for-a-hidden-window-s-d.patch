@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 11 Oct 2026 07:02:35 +0200
+Subject: [PATCH] wsi/metal: Don't wait forever for a hidden window's drawable
+ or present.
+
+Core Animation gives no drawable to a window that is hidden or
+occluded until it shows again, and it never reports such a window's
+frames as presented. With an infinite timeout, acquire spun until the
+window showed again and vkWaitForPresentKHR waited for good: a game
+started in the background (Age of Empires II: Definitive Edition,
+through DXVK) hung in its first frame.
+
+After Core Animation's own 1 s wait for a drawable, an acquire with an
+infinite timeout now reports VK_ERROR_OUT_OF_DATE_KHR, so the
+application recreates the swapchain or drops the frame. A present wait
+longer than 100 ms counts the frame as presented after 100 ms, which a
+visible window always reaches within a refresh.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Generated-by: LLM
+---
+ src/vulkan/wsi/wsi_common_metal.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_metal.c b/src/vulkan/wsi/wsi_common_metal.c
+index 54542c6..0d9c8f8 100644
+--- a/src/vulkan/wsi/wsi_common_metal.c
++++ b/src/vulkan/wsi/wsi_common_metal.c
+@@ -620,6 +620,12 @@ wsi_metal_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+          return VK_SUCCESS;
+       }
+ 
++      /* No drawable within Core Animation's 1 s: the window is hidden or occluded, and Core Animation holds the
++       * drawables it was given. Don't spin until the window shows again (an infinite timeout hung the caller):
++       * report the swapchain out of date, so the application recreates it or drops the frame. */
++      if (info->timeout == UINT64_MAX)
++         return VK_ERROR_OUT_OF_DATE_KHR;
++
+       /* Check for timeout. */
+       struct timespec current_time;
+       clock_gettime(CLOCK_MONOTONIC, &current_time);
+@@ -732,6 +738,13 @@ wsi_metal_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
+ 
+    struct timespec abs_timespec;
+    uint64_t abs_timeout = 0;
++   /* A hidden or occluded window never shows its frames, and the presented handler may then never run:
++    * a long wait counts the frame as presented after 100 ms (a visible window presents within a refresh). */
++   const uint64_t hidden_cap = 100 * 1000 * 1000ull;
++   const bool capped = timeout > hidden_cap;
++
++   if (capped)
++      timeout = hidden_cap;
+ 
+    if (timeout != 0)
+       abs_timeout = os_time_get_absolute_timeout(timeout);
+@@ -751,7 +764,7 @@ wsi_metal_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
+                                           &present_info->mutex,
+                                           &abs_timespec);
+       if (ret == thrd_timedout) {
+-         result = VK_TIMEOUT;
++         result = capped ? VK_SUCCESS : VK_TIMEOUT;
+          break;
+       }
+       if (ret != thrd_success) {
+-- 
+2.54.0 (Apple Git-157)
+

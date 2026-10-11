@@ -69,6 +69,13 @@ public struct PrefixManager: Sendable {
                 try prepareNew(environment: environment)
                 try want.write(to: context.versionFile, atomically: true, encoding: .utf8)
             }
+            // The backend's Direct3D DLLs, every launch: a game switched between DXMT and DXVK gets the other's back
+            // (install copies only what differs). wined3d's overrides take Wine's own.
+            switch GraphicsBackend(rawValue: environment["MACNEUTRON_GRAPHICS"] ?? "") ?? .dxmt {
+            case .dxmt: try installDLLs(ToolLayout.dxmtDLLs, from: layout.dxmt)
+            case .dxvk: try installDLLs(ToolLayout.dxvkDLLs, from: layout.dxvk)
+            case .wined3d: break
+            }
             if steamBridge { try deploySteamBridge() }
         }
     }
@@ -88,10 +95,16 @@ public struct PrefixManager: Sendable {
         // ponytail: best effort; if reg fails, crashes still work, they just show the dialog.
         _ = try runner.run(layout.wine, ["reg", "add", #"HKCU\Software\Wine\WineDbg"#, "/v", "ShowCrashDialog",
                                          "/t", "REG_DWORD", "/d", "0", "/f"], environment: environment, output: nil)
-        // Whatever the game's graphics setting: wined3d's overrides ignore them, and switching back to DXMT
-        // doesn't change the stamp. The identity covers DXMT, so they're refreshed whenever wine.app changes.
-        for name in ToolLayout.dxmtDLLs {
-            let source = layout.dxmt.appending(path: name), destination = "drive_c/windows/system32/\(name)"
+        // Whatever the game's graphics setting: wined3d's overrides ignore them, and a prefix first prepared for
+        // wined3d already holds DXMT's. prepare() puts the launch's backend's in place after this.
+        try installDLLs(ToolLayout.dxmtDLLs, from: layout.dxmt)
+        _ = try runner.run(layout.wineserver, ["-w"], environment: environment, output: nil)
+    }
+
+    /// `names` from the runtime's `folder` into the prefix's `system32`.
+    private func installDLLs(_ names: [String], from folder: URL) throws {
+        for name in names {
+            let source = folder.appending(path: name), destination = "drive_c/windows/system32/\(name)"
             guard FileManager.default.fileExists(atPath: source.path(percentEncoded: false)) else {
                 throw PrefixError.dllCopyFailed("\(destination): missing from the runtime (\(source.path(percentEncoded: false)))")
             }
@@ -99,7 +112,6 @@ public struct PrefixManager: Sendable {
                 throw PrefixError.dllCopyFailed("\(destination): \(error.localizedDescription)")
             }
         }
-        _ = try runner.run(layout.wineserver, ["-w"], environment: environment, output: nil)
     }
 
     /// `pfx` → the first free `pfx.rosetta`, `pfx.rosetta-2`, … (the saves inside stay where the player can find them).

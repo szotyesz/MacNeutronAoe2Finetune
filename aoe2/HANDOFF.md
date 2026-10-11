@@ -33,8 +33,9 @@ Everything below was done on a Mac16,13 (M4) running macOS 27.0.1 (26A434), Xcod
 3. **Xcode 27** in `/Applications`, opened once. Then either `sudo xcode-select -s /Applications/Xcode.app` or
    `export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` in every shell, then
    `xcodebuild -downloadComponent MetalToolchain` (about 840 MB).
-4. **Homebrew**, then `brew install autoconf bison flex cmake ninja meson pkg-config gettext`. The build uses the
-   keg-only `bison` and `flex` by itself.
+4. **Homebrew**, then `brew install autoconf bison flex cmake ninja meson pkg-config gettext llvm spirv-llvm-translator
+   python`. The build uses the keg-only `bison`, `flex` and `llvm` by itself; `llvm` and `spirv-llvm-translator` must
+   be the same major version (build.sh checks), and only KosmicKrisp's build-time compilers link them.
 5. **Privacy & Security** for the terminal app: **Screen Recording** (`check.sh dxmt-present`, `winshot`). Grant it,
    then quit and reopen the terminal. Accessibility is not needed.
 6. **External SSD** formatted **APFS**. The build relies on `cp -c` clones; the default case-insensitive variant is
@@ -208,7 +209,22 @@ State on 2026-10-09; details in the session plan (`declarative-splashing-hammock
      x64 tests pass. Waiting for the user's play test, now possible in full sessions (item 5 is fixed).
 3. **Other renderers than DXMT?** The rendering problems are still there, and the game feels a little sluggish.
    - **Chosen: DXVK 3.1.1 (ARM64EC) on KosmicKrisp** (Mesa's Vulkan on Metal): text renders right (user, 2026-10-08).
-     wined3d has no feature level on macOS's OpenGL. Not yet in the normal build.
+     wined3d has no feature level on macOS's OpenGL.
+   - **In the normal build since 2026-10-11, the default for AoE2DE only** (user's choice; DXMT stays every other
+     game's default):
+     - `make wine-arm64` builds the Vulkan stack from source, pinned in `wine-arm64/vulkan.pins`:
+       - Khronos' Vulkan headers and loader (`libvulkan.1.dylib`); Wine is configured `--with-vulkan` against it;
+       - KosmicKrisp from shadexternals' Mesa with `wine-arm64/patches/mesa` (dappermint's two, plus ours: hidden-window
+         acquire/present waits and present scaling; downstream only, `Generated-by: LLM` as Mesa's policy asks);
+       - DXVK 3.1.1 as ARM64EC.
+     - Bundle layout: `Resources/DXVK/aarch64-windows` holds d3d10core, d3d11 and dxgi. The loader and the driver go
+       in `lib/wine/aarch64-unix`, the driver manifest in `Resources/vulkan/icd.d`. Licences: `licenses/{dxvk,mesa,
+       vulkan-loader,vulkan-headers}`, plus xxHash and SoftFloat in NOTICES.md.
+     - Launcher: `GraphicsBackend.dxvk` (overrides `dxgi,d3d10core,d3d11=n,b;d3d9,d3d10,d3d12=b`) and
+       `gameDefaults` (813780 → dxvk). Each launch puts the backend's DLLs into `system32`, and a DXVK launch sets
+       `VK_DRIVER_FILES` to the bundle's manifest. The Games window offers DXVK.
+     - Wine patch 0029 (loader realpath) and the games category in `wine-arm64/Info.plist` (Game Mode).
+     - Test: `check.sh dxvk` runs the five D3D11 programs, ARM64EC and x64, on DXVK and KosmicKrisp.
 4. **Integrate CaptureAge.** On Linux this works through a wrapper exe that starts both AoE2DE and CaptureAge, so they
    run in the same environment (the same Proton prefix and session) and can share resources. Do the same here.
 5. **The game quit on its own 1.5–4 min after launch: fixed by Wine patch 0028** (2026-10-11). Every session since
@@ -228,8 +244,11 @@ State on 2026-10-09; details in the session plan (`declarative-splashing-hammock
      `exportstubs`). Prototype for a built `wine.app`: `aoe2/tools/fixstubs.py` (same output, byte for byte).
    - **Evidence:** with kernel32, kernelbase, user32 and advapi32 rewritten, no thread started at `+2C18ED4`, and the
      game ran past 15 min without the class-19 call.
-   - **Installed runtime:** patched in place with the prototype (backup `wine.app.bak-stubs` in the tool folder); its
-     user32 and advapi32 still have their delay-load stubs bare, which a rebuild with patch 0028 covers.
+   - **Installed runtime:** patched in place with the prototype (backup `wine.app.bak-stubs` in the tool folder).
+     - Its user32 and advapi32 still have their delay-load stubs bare.
+     - Its ntdll lacks 0028's `arm64x_check_call` change, so ARM64EC callers (DXVK, Wine's DLLs) run the rewritten
+       stubs through FEX instead of jumping straight to the target.
+     - Both are fixed in a rebuilt runtime.
    - **Watch for:**
      - The same write-up describes a later kill (about 8–10 min) when handling an exception is slow (a wineserver
        round trip per `NtContinue`). Ours costs about 5 µs (`n3.md`), so it is probably not an issue here.

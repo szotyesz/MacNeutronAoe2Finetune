@@ -54,13 +54,24 @@ lsteamclient_series() {  # lsteamclient_series <deps.pins> <patch>...
 
 # The series each tree is patched with, as build.sh patches it, and the tree's build_mode against it (build.sh,
 # bundle.sh --release and release.sh agree through these). The caller sets ROOT; BUILD_DIR replaces build/.
-tree_series() {  # tree_series <wine|fex|dxmt|lsteamclient>
+tree_series() {  # tree_series <wine|fex|dxmt|lsteamclient|vulkan-headers|vulkan-loader|mesa|dxvk>
   case $1 in
     wine|fex) series_of "$ROOT/wine-arm64/pins" "$ROOT/wine-arm64/patches/$1"/*.patch ;;
     dxmt) series_of "$ROOT/dxmt/pins" "$ROOT/wine-arm64/patches/dxmt"/*.patch ;;
     lsteamclient) lsteamclient_series "$ROOT/wine-arm64/deps.pins" "$ROOT/wine-arm64/patches/lsteamclient"/*.patch ;;
+    vulkan-headers) vulkan_series VULKAN_HEADERS ;;
+    vulkan-loader) vulkan_series VULKAN_LOADER ;;
+    mesa) vulkan_series MESA "$ROOT/wine-arm64/patches/mesa"/*.patch ;;
+    dxvk) vulkan_series DXVK ;;
     *) die "no tree $1" ;;
   esac
+}
+# A tree of the Vulkan stack (vulkan.pins): its own <PREFIX>_ lines there and its patches, so that one pin's change
+# doesn't refetch the others.
+vulkan_series() {  # vulkan_series <PREFIX> [<patch>...]
+  _vs_p=$1; shift
+  for _vs_f in "$ROOT/wine-arm64/vulkan.pins" "$@"; do [ -f "$_vs_f" ] || die "no such build input: $_vs_f"; done
+  { LC_ALL=C /usr/bin/grep -E "^${_vs_p}_" "$ROOT/wine-arm64/vulkan.pins"; cat "$@"; } | shasum -a 256 | cut -d ' ' -f 1
 }
 tree_mode() {  # tree_mode <tree>
   _tm_s="${BUILD_DIR:-$ROOT/build}/wine-arm64-src"
@@ -92,6 +103,17 @@ write_source() {  # write_source <out> <mac>
     echo "LSTEAMCLIENT_COMMIT=$LSTEAMCLIENT_COMMIT"
     echo "LSTEAMCLIENT_SERIES=$(series lsteamclient)"
     deps_pins  # <NAME>_URL, <NAME>_SHA256
+    . "$ROOT/wine-arm64/vulkan.pins"
+    echo "VULKAN_HEADERS_COMMIT=$VULKAN_HEADERS_COMMIT"
+    echo "VULKAN_LOADER_COMMIT=$VULKAN_LOADER_COMMIT"
+    echo "MESA_COMMIT=$MESA_COMMIT"
+    echo "MESA_SERIES=$(series mesa)"
+    echo "DXVK_COMMIT=$DXVK_COMMIT"
+    echo "DXVK_SERIES=$(series dxvk)"
+    # include/native/directx, include/spirv, include/vulkan, subprojects/dxbc-spirv (and its spirv_headers),
+    # subprojects/libdisplay-info
+    git -C "$S/dxvk" submodule status --recursive | awk '{ c = $1; sub(/^[-+U]/, "", c); n = $2; sub(/.*\//, "", n)
+      print "DXVK_SUBMODULE_" n "=" c }'
   ) > "$1"
 }
 

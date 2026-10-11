@@ -35,12 +35,13 @@ struct GamesView: View {
                 TableColumn("Graphics") { row in
                     if row.runsWithMacNeutron {
                         Picker("", selection: Binding(
-                            // A value from before 0.1 (d3dmetal, dxvk) runs DXMT, so it shows as the default.
+                            // A value from before 0.1 (d3dmetal) runs the default, so it shows as the default.
                             get: { row.settings.graphics.flatMap { GraphicsBackend(rawValue: $0)?.rawValue } ?? "" },
                             set: { value in Task { await model.update(row.id) { $0.graphics = value.isEmpty ? nil : value } } })) {
-                            Text("Default (DXMT)").tag("")
-                            Text("DXMT").tag("dxmt")
-                            Text("wined3d (OpenGL)").tag("wined3d")
+                            Text("Default (\(GraphicsBackend.defaultBackend(appID: String(row.id)).displayName))").tag("")
+                            ForEach(GraphicsBackend.allCases, id: \.self) { backend in
+                                Text(backend.displayName).tag(backend.rawValue)
+                            }
                         }
                         .labelsHidden()
                     } else {

@@ -42,8 +42,9 @@ text, does TLS, synchronises with msync and reaches Steam through an arm64 Steam
 Its `wine.app` carries every component's licence in `Contents/Resources/licenses` (`wine-arm64/licenses/README`).
 Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.
 
-`make wine-arm64` needs `brew install cmake ninja meson` and Xcode's Metal Toolchain
-(`xcodebuild -downloadComponent MetalToolchain`). Windows-side binaries are built with Clang from the pinned llvm-mingw,
+`make wine-arm64` needs `brew install cmake ninja meson llvm spirv-llvm-translator python` and Xcode's Metal
+Toolchain (`xcodebuild -downloadComponent MetalToolchain`); llvm and the SPIR-V translator build KosmicKrisp's
+compilers (the shipped driver links neither), and pip fetches Mesa's pinned Python modules into the build folder. Windows-side binaries are built with Clang from the pinned llvm-mingw,
 which the build fetches once (118 MB). `make app` signs with `MACNEUTRON_SIGN_IDENTITY` and
 `MACNEUTRON_PROVISIONING_PROFILE`.
 

@@ -172,6 +172,27 @@ private let disableCrashDialog = ["reg", "add", #"HKCU\Software\Wine\WineDbg"#, 
     #expect(try String(contentsOf: d3d11, encoding: .utf8) == "dxmt d3d11.dll")
 }
 
+@Test func dxvkLaunchesGetDXVKsDLLsAndDXMTComesBack() throws {
+    let runner = winebootCreatingPrefix()
+    let (manager, dxvk) = try makeManager(runner, backend: .dxvk)
+    let system32 = manager.context.prefix.appending(path: "drive_c/windows/system32", directoryHint: .isDirectory)
+    func dll(_ name: String) throws -> String { try String(contentsOf: system32.appending(path: name), encoding: .utf8) }
+    try manager.prepare(environment: dxvk)
+    for name in ToolLayout.dxvkDLLs { #expect(try dll(name) == "dxvk \(name)") }
+    #expect(try dll("d3d12.dll") == "dxmt d3d12.dll")  // left alone: DXVK's overrides take Wine's own
+    try manager.prepare(environment: wineEnvironment(manager, backend: .dxmt))
+    for name in ToolLayout.dxmtDLLs { #expect(try dll(name) == "dxmt \(name)") }
+    try manager.prepare(environment: dxvk)
+    #expect(try dll("d3d11.dll") == "dxvk d3d11.dll")
+    #expect(winebootCount(runner) == 1)
+}
+
+@Test func missingDXVKDLLIsAnError() throws {
+    let (manager, dxvk) = try makeManager(winebootCreatingPrefix(), backend: .dxvk)
+    try FileManager.default.removeItem(at: manager.layout.dxvk.appending(path: "dxgi.dll"))
+    #expect(throws: PrefixError.self) { try manager.prepare(environment: dxvk) }
+}
+
 @Test func missingRuntimeDLLIsAnError() throws {
     let (manager, env) = try makeManager(winebootCreatingPrefix())
     try FileManager.default.removeItem(at: manager.layout.dxmt.appending(path: "d3d11.dll"))

@@ -75,9 +75,31 @@ steamclient.dylib)
   wine-arm64/deps.pins), with the patches in the repository's wine-arm64/patches/lsteamclient (dappermint/winecx's
   three Mac fixes).
 
+DXVK 3.1.1 (the Direct3D to Vulkan DLLs in ../DXVK/aarch64-windows, for the games that render with DXVK)
+  Licence: zlib, dxvk/LICENSE. Compiled in: dxbc-spirv (MIT), dxvk/dxbc-spirv-LICENSE; libdisplay-info (MIT),
+  dxvk/libdisplay-info-LICENSE; the mingw-w64 DirectX headers, dxvk/directx-COPYING.MinGW-w64.txt; the SPIR-V headers,
+  dxvk/spirv-headers-LICENSE; the Vulkan headers (Apache-2.0 OR MIT), dxvk/vulkan-headers-LICENSE.md.
+  Source: https://github.com/doitsujin/dxvk.git at DXVK_COMMIT (tag v3.1.1; ../DXVK/version names it too) with its
+  submodules at the DXVK_SUBMODULE_* commits, unmodified (pinned in wine-arm64/vulkan.pins).
+
+KosmicKrisp (libvulkan_kosmickrisp.dylib: Mesa's Vulkan driver on Metal, which DXVK runs on)
+  Licence: MIT, mesa/MIT; Mesa's overview of its licences, mesa/license.rst, and the other texts its sources name:
+  mesa/Apache-2.0, mesa/BSL-1.0, mesa/SGI-B-2.0. xxHash (BSD-2-Clause) and Berkeley SoftFloat (BSD-3-Clause):
+  NOTICES.md.
+  Source: https://github.com/shadexternals/mesa.git at MESA_COMMIT, with the patches in the repository's
+  wine-arm64/patches/mesa (pinned in wine-arm64/vulkan.pins).
+
+The Vulkan loader (libvulkan.1.dylib, which Wine's winevulkan loads)
+  Licence: Apache-2.0, vulkan-loader/LICENSE.txt. Built against the Vulkan headers (Apache-2.0 OR MIT):
+  vulkan-headers/LICENSE.md, vulkan-headers/Apache-2.0.txt, vulkan-headers/MIT.txt.
+  Source: https://github.com/KhronosGroup/Vulkan-Loader.git at VULKAN_LOADER_COMMIT and
+  https://github.com/KhronosGroup/Vulkan-Headers.git at VULKAN_HEADERS_COMMIT, unmodified (pinned in
+  wine-arm64/vulkan.pins).
+
 MacNeutron (libmacneutron-present.dylib, the MetalFX presenter)
   Licence: MIT, macneutron/LICENSE.
   Source: the repository at MACNEUTRON_COMMIT: presenter/present.m. The patch files in wine-arm64/patches keep the
-  licence of the tree they patch (Wine and DXMT: LGPL-2.1-or-later; FEX: MIT; lsteamclient: Valve's terms).
+  licence of the tree they patch (Wine and DXMT: LGPL-2.1-or-later; FEX and KosmicKrisp: MIT; lsteamclient: Valve's
+  terms).
 
 FreeType: Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.

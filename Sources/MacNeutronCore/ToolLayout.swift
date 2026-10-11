@@ -31,6 +31,12 @@ public struct ToolLayout: Equatable, Sendable {
     }
     /// DXMT's pipeline replayer (shader pre-caching), run by the launcher under Wine.
     public var dxmtReplay: URL { dxmt.appending(path: "dxmt-replay.exe") }
+    /// DXVK's front ends, which a prefix whose game renders with DXVK gets in `system32` instead of DXMT's.
+    public var dxvk: URL { resources.appending(path: "DXVK/aarch64-windows", directoryHint: .isDirectory) }
+    public static let dxvkDLLs = ["d3d10core.dll", "d3d11.dll", "dxgi.dll"]
+    public var dxvkVersionFile: URL { resources.appending(path: "DXVK/version") }
+    /// KosmicKrisp's Vulkan driver manifest, which a DXVK launch names in `VK_DRIVER_FILES`.
+    public var vulkanDriverManifest: URL { resources.appending(path: "vulkan/icd.d/kosmickrisp_icd.json") }
     /// The Steam client bridge (Proton's lsteamclient), both halves.
     public var lsteamclient: URL { resources.appending(path: "lib/wine/aarch64-windows/lsteamclient.dll") }
     public var lsteamclientUnix: URL { resources.appending(path: "lib/wine/aarch64-unix/lsteamclient.so") }

@@ -7,6 +7,8 @@ public enum LaunchEnvironment {
                              logging: Bool) -> [String: String] {
         var env = base
         env["WINEPREFIX"] = context.prefix.path(percentEncoded: false)
+        // The backend chosen, by name: the prefix manager installs its DLLs, and the game's log shows it.
+        env["MACNEUTRON_GRAPHICS"] = backend.rawValue
         env["WINEDLLOVERRIDES"] = mergeOverrides(backend.dllOverrides, user: base["WINEDLLOVERRIDES"])
         if base["WINEDEBUG"] == nil {
             env["WINEDEBUG"] = logging ? "+err,+warn,+loaddll,+steamclient,+timestamp" : "-all"

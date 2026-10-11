@@ -69,6 +69,24 @@ check() {  # check <wine.app> <build dir>
       || miss "lsteamclient entry in README with the maintainer's decision of 2026-10-04"
   fi
 
+  # 4b. The Vulkan stack (aoe2's DXVK), once it is in the bundle.
+  if has libvulkan_kosmickrisp.dylib; then
+    for f in mesa/license.rst mesa/MIT mesa/Apache-2.0 mesa/BSL-1.0 mesa/SGI-B-2.0 vulkan-loader/LICENSE.txt \
+             vulkan-headers/LICENSE.md vulkan-headers/Apache-2.0.txt vulkan-headers/MIT.txt
+    do [ -s "$L/$f" ] || miss "$f"; done
+    for h in "Yann Collet" "Berkeley SoftFloat"; do g -qF "$h" "$L/NOTICES.md" 2> /dev/null || miss "NOTICES.md entry for $h"; done
+    g -qF "KosmicKrisp (libvulkan_kosmickrisp.dylib" "$L/README" 2> /dev/null || miss "KosmicKrisp entry in README"
+    g -qF "The Vulkan loader (libvulkan.1.dylib" "$L/README" 2> /dev/null || miss "Vulkan loader entry in README"
+    for k in VULKAN_HEADERS_COMMIT VULKAN_LOADER_COMMIT MESA_COMMIT MESA_SERIES; do key "$k"; done
+  fi
+  if [ -d "$R/DXVK" ]; then
+    for f in LICENSE dxbc-spirv-LICENSE libdisplay-info-LICENSE directx-COPYING.MinGW-w64.txt spirv-headers-LICENSE \
+             vulkan-headers-LICENSE.md
+    do [ -s "$L/dxvk/$f" ] || miss "dxvk/$f"; done
+    g -qF "DXVK 3.1.1 (the Direct3D to Vulkan DLLs" "$L/README" 2> /dev/null || miss "DXVK entry in README"
+    for k in DXVK_COMMIT DXVK_SERIES DXVK_SUBMODULE_dxbc-spirv DXVK_SUBMODULE_libdisplay-info; do key "$k"; done
+  fi
+
   # 5. Source correspondence: SOURCE names the exact inputs.
   for k in MACNEUTRON_COMMIT WINE_COMMIT WINE_SERIES FEX_COMMIT FEX_SERIES FEX_SUBMODULE_fmt FEX_SUBMODULE_range-v3 \
            FEX_SUBMODULE_rpmalloc FEX_SUBMODULE_unordered_dense FEX_SUBMODULE_xxhash FEX_SUBMODULE_cpp-optparse \

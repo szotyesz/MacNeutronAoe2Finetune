@@ -37,6 +37,9 @@ FEX_SO="$B/wine-arm64-src/fex-unixlib/libarm64ecfex.so"
 DXMT_IN="$B/wine-arm64-src/dxmt-install"
 DXMT_TREE="$B/wine-arm64-src/dxmt"
 DEPS="$B/wine-arm64-src/deps"
+VI="$B/wine-arm64-src/vulkan-install"
+KK="$B/wine-arm64-src/mesa-build/src/kosmickrisp/vulkan"
+DXVK_IN="$B/wine-arm64-src/dxvk-install"
 APP="$OUT/wine.app.tmp"
 R="$APP/Contents/Resources"
 INSTALL="$OUT/install.tmp"
@@ -49,6 +52,8 @@ ENTITLEMENTS=$(entitlements_file)
 [ -f "$FEX_DLL" ] && [ -f "$FEX_SO" ] || die "no FEX build in $B/wine-arm64-src: run make wine-arm64"
 [ -d "$DXMT_IN" ] || die "no DXMT build at $DXMT_IN: run make wine-arm64"
 [ -f "$DEPS/.complete" ] || die "no FreeType and gnutls build at $DEPS: run make wine-arm64"
+[ -f "$VI/lib/libvulkan.1.dylib" ] && [ -f "$KK/libvulkan_kosmickrisp.dylib" ] && [ -d "$DXVK_IN" ] \
+  || die "no Vulkan loader, KosmicKrisp or DXVK build in $B/wine-arm64-src: run make wine-arm64"
 mkdir -p "$OUT"
 rm -rf "$APP" "$INSTALL"
 trap 'rm -rf "$INSTALL"' EXIT
@@ -88,6 +93,27 @@ U="$R/lib/wine/aarch64-unix"
 for l in libfreetype.6.dylib libgnutls.30.dylib; do put "$DEPS/lib" "$l" "$U/"; done
 # The MetalFX presenter (arm64 release spec §5.3): winemetal.so loads it from its own folder (DXMT patch 0002).
 put "$B/wine-arm64-src/presenter" libmacneutron-present.dylib "$U/"
+# The Vulkan stack (aoe2's DXVK). The loader beside the unix libraries, as FreeType: winevulkan.so dlopens it by name.
+# KosmicKrisp beside it, named by its manifest, which sits where the loader looks inside an app bundle
+# (Contents/Resources/vulkan/icd.d) and which the launcher also names in VK_DRIVER_FILES; its library path is relative to
+# the manifest. DXVK's front ends are native DLLs that the launcher copies into the system32 of a prefix whose game
+# renders with DXVK: they keep to DXVK/, with the version.
+put "$VI/lib" libvulkan.1.dylib "$U/"
+put "$KK" libvulkan_kosmickrisp.dylib "$U/"
+api=$(sed -n 's/.*"api_version": *"\([0-9.]*\)".*/\1/p' "$KK/kosmickrisp_mesa_icd.aarch64.json")
+[ -n "$api" ] || die "no api_version in $KK/kosmickrisp_mesa_icd.aarch64.json"
+mkdir -p "$R/vulkan/icd.d" "$R/DXVK/aarch64-windows"
+cat > "$R/vulkan/icd.d/kosmickrisp_icd.json" << EOF
+{
+    "ICD": {
+        "api_version": "$api",
+        "library_path": "../../lib/wine/aarch64-unix/libvulkan_kosmickrisp.dylib"
+    },
+    "file_format_version": "1.0.1"
+}
+EOF
+for f in d3d10core.dll d3d11.dll dxgi.dll; do put "$DXVK_IN" "aarch64-windows/$f" "$R/DXVK/aarch64-windows/"; done
+put "$DXVK_IN" version "$R/DXVK/"
 # Licences (ship-base spec §4): the components' own texts, the committed README and NOTICES.md, and build.sh's SOURCE.
 # DXMT's stay in DXMT/.
 L="$R/licenses"
@@ -127,6 +153,21 @@ put "$DS/gnutls" lib/inih/LICENSE.txt "$L/gnutls/inih-LICENSE.txt"
 for f in COPYING.LESSERv3 COPYINGv3; do
   put "$DS/nettle" "$f" "$L/gnutls/"; put "$DS/nettle" "$f" "$L/nettle/"; put "$DS/gmp" "$f" "$L/gmp/"
 done
+# The Vulkan stack: DXVK's licence and those of what it compiles in (dxbc-spirv, libdisplay-info, and the DirectX,
+# SPIR-V and Vulkan headers); Mesa's overview and the licence texts its sources name (KosmicKrisp is MIT; Mesa's util
+# code brings BSL-1.0, Apache-2.0 and SGI-B-2.0 parts); the Vulkan loader's and the headers it is built against.
+mkdir -p "$L/dxvk" "$L/mesa" "$L/vulkan-loader" "$L/vulkan-headers"
+put "$S/dxvk" LICENSE "$L/dxvk/"
+put "$S/dxvk" subprojects/dxbc-spirv/LICENSE "$L/dxvk/dxbc-spirv-LICENSE"
+put "$S/dxvk" subprojects/libdisplay-info/LICENSE "$L/dxvk/libdisplay-info-LICENSE"
+put "$S/dxvk" include/native/directx/COPYING.MinGW-w64.txt "$L/dxvk/directx-COPYING.MinGW-w64.txt"
+put "$S/dxvk" include/spirv/LICENSE "$L/dxvk/spirv-headers-LICENSE"
+put "$S/dxvk" include/vulkan/LICENSE.md "$L/dxvk/vulkan-headers-LICENSE.md"
+put "$S/mesa" docs/license.rst "$L/mesa/"
+for f in MIT Apache-2.0 BSL-1.0 SGI-B-2.0; do put "$S/mesa" "licenses/$f" "$L/mesa/"; done
+put "$S/vulkan-loader" LICENSE.txt "$L/vulkan-loader/"
+put "$S/vulkan-headers" LICENSE.md "$L/vulkan-headers/"
+for f in Apache-2.0.txt MIT.txt; do put "$S/vulkan-headers" "LICENSES/$f" "$L/vulkan-headers/"; done
 # lsteamclient (ship-base spec §7): Valve's Steamworks SDK licence, and a note for the one file under another.
 mkdir -p "$L/lsteamclient"
 put "$S/lsteamclient/lsteamclient" LICENSE "$L/lsteamclient/"
@@ -170,7 +211,8 @@ if [ -n "$release" ]; then
     rm "$R/bin/$t"
   done
   llvm_strip="$(sh "$ROOT/dxmt/toolchain.sh")/llvm-strip"
-  find "$R/lib/wine/aarch64-windows" "$R/DXMT/aarch64-windows" -type f -print0 | xargs -0 file \
+  find "$R/lib/wine/aarch64-windows" "$R/DXMT/aarch64-windows" "$R/DXVK/aarch64-windows" -type f -print0 \
+    | xargs -0 file \
     | sed -n 's/: *PE32.*//p' > "$OUT/pe.list"
   [ -s "$OUT/pe.list" ] || die "no PE files found to strip"
   while IFS= read -r f; do
@@ -286,6 +328,21 @@ for f in d3d11.dll d3d10core.dll dxgi.dll d3d12.dll dxmt-replay.exe; do
 done
 ver=$(cat "$R/DXMT/version")
 case $ver in "$DXMT_COMMIT"+?*) ;; *) die "DXMT/version is '$ver', not $DXMT_COMMIT+<series or dev>" ;; esac
+# The Vulkan stack: winevulkan built (Wine has Vulkan), the libraries found by @rpath, the manifest naming the driver
+# beside them, and DXVK's DLLs native ones with the pin in DXVK/version.
+[ -f "$U/winevulkan.so" ] || die "no lib/wine/aarch64-unix/winevulkan.so: Wine was built without Vulkan"
+for l in libvulkan.1.dylib libvulkan_kosmickrisp.dylib; do
+  id=$(otool -D "$U/$l" | tail -n +2)
+  [ "$id" = "@rpath/$l" ] || die "$l's install name is ${id:-missing}, not @rpath/$l"
+done
+[ "$(cd "$R/vulkan/icd.d" && realpath ../../lib/wine/aarch64-unix/libvulkan_kosmickrisp.dylib)" \
+  = "$(realpath "$U/libvulkan_kosmickrisp.dylib")" ] || die "vulkan/icd.d/kosmickrisp_icd.json doesn't name the driver"
+for f in d3d10core.dll d3d11.dll dxgi.dll; do
+  ! builtin "$R/DXVK/aarch64-windows/$f" || die "DXVK's $f carries Wine's builtin marker"
+done
+. "$ROOT/wine-arm64/vulkan.pins"
+ver=$(cat "$R/DXVK/version")
+case $ver in "$DXVK_COMMIT"|"$DXVK_COMMIT+dev") ;; *) die "DXVK/version is '$ver', not $DXVK_COMMIT[+dev]" ;; esac
 git -C "$DXMT_TREE" merge-base --is-ancestor "$DXMT_COMMIT" HEAD \
   || die "$DXMT_COMMIT (dxmt/pins) is not an ancestor of HEAD in $DXMT_TREE"
 # The Steam bridge (ship-base spec §7): an ARM64X Wine builtin (llvm-readobj prints a CHPEMetadata block only for a

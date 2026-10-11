@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 11 Oct 2026 07:02:45 +0200
+Subject: [PATCH] wsi/metal: Support present scaling through the layer's
+ contents gravity.
+
+VkSwapchainPresentScalingCreateInfoKHR asks how an image whose size
+differs from the surface's is shown. Core Animation already fits a
+drawable to its layer: advertise one-to-one, aspect-ratio stretch and
+stretch, centred, and set the layer's contentsGravity to match, with a
+black background for the bars of an aspect-ratio fit. A swapchain
+created with a scaling mode is no longer suboptimal when its size
+differs from the layer's, so the application doesn't recreate it every
+frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Generated-by: LLM
+---
+ src/vulkan/wsi/wsi_common_metal.c       | 23 ++++++++++++++++-------
+ src/vulkan/wsi/wsi_common_metal_layer.h |  3 ++-
+ src/vulkan/wsi/wsi_common_metal_layer.m | 12 +++++++++++-
+ 3 files changed, 29 insertions(+), 9 deletions(-)
+
+diff --git a/src/vulkan/wsi/wsi_common_metal.c b/src/vulkan/wsi/wsi_common_metal.c
+index 0d9c8f8..eef7c78 100644
+--- a/src/vulkan/wsi/wsi_common_metal.c
++++ b/src/vulkan/wsi/wsi_common_metal.c
+@@ -130,11 +130,13 @@ wsi_metal_surface_get_capabilities2(VkIcdSurfaceBase *surface,
+       }
+ 
+       case VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_KHR: {
+-         /* TODO: support scaling */
++         /* Core Animation scales the drawable to the layer (contentsGravity), centred. */
+          VkSurfacePresentScalingCapabilitiesKHR *scaling = ext;
+-         scaling->supportedPresentScaling = 0;
+-         scaling->supportedPresentGravityX = 0;
+-         scaling->supportedPresentGravityY = 0;
++         scaling->supportedPresentScaling = VK_PRESENT_SCALING_ONE_TO_ONE_BIT_KHR |
++                                            VK_PRESENT_SCALING_ASPECT_RATIO_STRETCH_BIT_KHR |
++                                            VK_PRESENT_SCALING_STRETCH_BIT_KHR;
++         scaling->supportedPresentGravityX = VK_PRESENT_GRAVITY_CENTERED_BIT_KHR;
++         scaling->supportedPresentGravityY = VK_PRESENT_GRAVITY_CENTERED_BIT_KHR;
+          scaling->minScaledImageExtent = caps->surfaceCapabilities.minImageExtent;
+          scaling->maxScaledImageExtent = caps->surfaceCapabilities.maxImageExtent;
+          break;
+@@ -356,6 +358,9 @@ struct wsi_metal_swapchain {
+    VkExtent2D extent;
+    VkFormat vk_format;
+ 
++   /* VkSwapchainPresentScalingCreateInfoKHR: Core Animation fits the image to the layer, so a size mismatch is fine */
++   VkPresentScalingFlagsKHR scaling;
++
+    VkIcdSurfaceMetal *surface;
+ 
+    struct wsi_metal_layer_blit_context *blit_context;
+@@ -724,7 +729,7 @@ wsi_metal_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+ 
+    uint32_t width = 0u, height = 0u;
+    wsi_metal_layer_size(chain->surface->pLayer, &width, &height);
+-   bool is_optimal = (width == chain->extent.width && height == chain->extent.height);
++   bool is_optimal = chain->scaling || (width == chain->extent.width && height == chain->extent.height);
+    return is_optimal ? VK_SUCCESS : VK_SUBOPTIMAL_KHR;
+ }
+ 
+@@ -745,7 +750,6 @@ wsi_metal_swapchain_wait_for_present(struct wsi_swapchain *wsi_chain,
+ 
+    if (capped)
+       timeout = hidden_cap;
+-
+    if (timeout != 0)
+       abs_timeout = os_time_get_absolute_timeout(timeout);
+ 
+@@ -915,10 +919,14 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    const bool layer_opaque = opaque_composition && wsi_device->sw;
+    const bool framebuffer_only = !wsi_device->sw;
+ 
++   const VkSwapchainPresentScalingCreateInfoKHR *scaling_info =
++      vk_find_struct_const(pCreateInfo->pNext, SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_KHR);
++
+    VkResult result = wsi_metal_layer_configure(metal_surface->pLayer,
+       pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
+       num_images, pCreateInfo->imageFormat, pCreateInfo->imageColorSpace,
+-      layer_opaque, immediate_mode, framebuffer_only);
++      layer_opaque, immediate_mode, framebuffer_only,
++      scaling_info ? scaling_info->scalingBehavior : 0);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -959,6 +967,7 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    chain->base.present_mode = wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
+    chain->base.image_count = num_images;
+    chain->extent = pCreateInfo->imageExtent;
++   chain->scaling = scaling_info ? scaling_info->scalingBehavior : 0;
+    chain->vk_format = pCreateInfo->imageFormat;
+    chain->surface = metal_surface;
+    chain->current_image_index = 0;
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.h b/src/vulkan/wsi/wsi_common_metal_layer.h
+index f98fd1a..7b87286 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.h
++++ b/src/vulkan/wsi/wsi_common_metal_layer.h
+@@ -27,7 +27,8 @@ VkResult
+ wsi_metal_layer_configure(const CAMetalLayer *metal_layer,
+    uint32_t width, uint32_t height, uint32_t image_count,
+    VkFormat format, VkColorSpaceKHR color_space,
+-   bool enable_opaque, bool enable_immediate, bool framebuffer_only);
++   bool enable_opaque, bool enable_immediate, bool framebuffer_only,
++   VkPresentScalingFlagsKHR scaling);
+ 
+ void
+ wsi_metal_layer_set_hdr_metadata(const CAMetalLayer *metal_layer,
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.m b/src/vulkan/wsi/wsi_common_metal_layer.m
+index 6308d70..205c60d 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.m
++++ b/src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -146,7 +146,8 @@
+ wsi_metal_layer_configure(const CAMetalLayer *metal_layer,
+    uint32_t width, uint32_t height, uint32_t image_count,
+    VkFormat format, VkColorSpaceKHR color_space,
+-   bool enable_opaque, bool enable_immediate, bool framebuffer_only)
++   bool enable_opaque, bool enable_immediate, bool framebuffer_only,
++   VkPresentScalingFlagsKHR scaling)
+ {
+    @autoreleasepool {
+       MTLPixelFormat metal_format;
+@@ -169,6 +170,15 @@
+ 
+       metal_layer.maximumDrawableCount = image_count;
+       metal_layer.drawableSize = (CGSize){.width = width, .height = height};
++      /* How Core Animation fits a drawable whose size differs from the layer's bounds
++       * (VkSwapchainPresentScalingCreateInfoKHR); the bars around a fitted image are black. */
++      if (scaling & VK_PRESENT_SCALING_ASPECT_RATIO_STRETCH_BIT_KHR)
++         metal_layer.contentsGravity = kCAGravityResizeAspect;
++      else if (scaling & VK_PRESENT_SCALING_ONE_TO_ONE_BIT_KHR)
++         metal_layer.contentsGravity = kCAGravityCenter;
++      else
++         metal_layer.contentsGravity = kCAGravityResize;
++      metal_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+       metal_layer.opaque = enable_opaque;
+       metal_layer.displaySyncEnabled = !enable_immediate;
+       metal_layer.pixelFormat = metal_format;
+-- 
+2.54.0 (Apple Git-157)
+

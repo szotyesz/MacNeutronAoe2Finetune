@@ -18,7 +18,7 @@ private struct Fixture {
 }
 
 private func makeFixture(runner: FakeRunner = winebootCreatingPrefix(), identity: String? = testIdentity,
-                         bridge: Bool = false) throws -> Fixture {
+                         bridge: Bool = false, appID: String = "42") throws -> Fixture {
     let notifier = RecordingNotifier()
     let layout = try makeToolLayout()
     if bridge { try installFakeSteamBridge(in: layout) }
@@ -28,7 +28,7 @@ private func makeFixture(runner: FakeRunner = winebootCreatingPrefix(), identity
                             notifier: notifier, preflight: Preflight(systemSupported: { true }, identity: { _ in identity }),
                             settings: GameSettingsStore(directory: try makeTempDir().appending(path: "games")),
                             steam: steam)
-    let env = steamEnvironment(dataPath: try makeTempDir().appending(path: "compatdata/42"), appID: "42")
+    let env = steamEnvironment(dataPath: try makeTempDir().appending(path: "compatdata/\(appID)"), appID: appID)
     return Fixture(launcher: launcher, runner: runner, notifier: notifier, env: env)
 }
 
@@ -195,14 +195,40 @@ private func i386Exe(named name: String) throws -> String {
     #expect(wine["WINEMSYNC"] == nil)
 }
 
+@Test func ageOfEmpiresIIRendersWithDXVKOnItsOwnKosmicKrisp() throws {
+    let f = try makeFixture(appID: "813780")
+    #expect(f.launcher.launch(["run", "/g/AoE2DE_s.exe"], environment: f.env) == 0)
+    let wine = try #require(f.runner.calls.last?.environment)
+    #expect(wine["WINEDLLOVERRIDES"] == "dxgi=n,b;d3d10core=n,b;d3d11=n,b;d3d9=b;d3d10=b;d3d12=b")
+    #expect(wine["VK_DRIVER_FILES"] == f.launcher.layout.vulkanDriverManifest.path(percentEncoded: false))
+    let d3d11 = try String(contentsOf: URL(filePath: try #require(wine["WINEPREFIX"]))
+        .appending(path: "drive_c/windows/system32/d3d11.dll"), encoding: .utf8)
+    #expect(d3d11 == "dxvk d3d11.dll")
+    #expect(f.launcherLog.contains("backend=dxvk"))
+}
+
+@Test func vulkanDriverChoiceOfTheUserWins() throws {
+    let f = try makeFixture(appID: "813780")
+    var env = f.env
+    env["VK_ICD_FILENAMES"] = "/mine.json"
+    _ = f.launcher.launch(["run", "/g/AoE2DE_s.exe"], environment: env)
+    #expect(f.runner.calls.last?.environment["VK_DRIVER_FILES"] == nil)
+}
+
+@Test func dxmtLaunchesNameNoVulkanDriver() throws {
+    let f = try makeFixture()
+    _ = f.launcher.launch(["run", "/g/Game.exe"], environment: f.env)
+    #expect(f.runner.calls.last?.environment["VK_DRIVER_FILES"] == nil)
+}
+
 @Test func oldGraphicsValueRunsDXMTWithANote() throws {
     let f = try makeFixture()
-    try f.launcher.settings.save(GameSettings(graphics: "dxvk"), for: "42")
+    try f.launcher.settings.save(GameSettings(graphics: "d3dmetal"), for: "42")
     #expect(f.launcher.launch(["run", "/g/Game.exe"], environment: f.env) == 0)
     #expect(f.runner.calls.last?.environment["WINEDLLOVERRIDES"]?.hasPrefix("dxgi=n,b;d3d10core=n,b;d3d11=n,b") == true)
     let line = try #require(f.launcherLog.split(separator: "\n").last { $0.contains(" verb=run ") })
     #expect(line.contains("backend=dxmt"))
-    #expect(line.contains("'dxvk' was removed in 0.1, using dxmt"))
+    #expect(line.contains("'d3dmetal' was removed in 0.1, using dxmt"))
 }
 
 @Test func unreadableGameSettingsAreIgnored() throws {
