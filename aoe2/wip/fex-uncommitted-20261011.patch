@@ -1,0 +1,652 @@
+Uncommitted FEX changes on 2026-10-11, saved so they aren't lost; not part of the build's patch series.
+Downstream only: written with Claude for MacNeutron, never for submission to FEX (FEX takes no AI-written code).
+Base: the FEX tree with wine-arm64/patches/fex 0001-0010 applied (commit b71e03d in build/wine-arm64-src/fex).
+Apply with: git -C build/wine-arm64-src/fex apply aoe2/wip/fex-uncommitted-20261011.patch
+- Pool buffers: code from non-file-backed memory compiles into separate, recycled buffers (MACNEUTRON_POOL_BUFFER_MB),
+  plus MACNEUTRON_CODE_BUFFER_MB; test in wine-arm64/tests/x64-poolchurn.c (HANDOFF §4 item 2).
+- No deadlock when VirtualDontNeed frees the call-ret stack under the code invalidation lock (memset instead,
+  FEXCore::Allocator::SuppressMemoryNotifications).
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index df8e871..ffc4e8c 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -218,6 +218,8 @@ public:
+   }
+ 
+   void OnCodeBufferAllocated(const std::shared_ptr<CPU::CodeBuffer>&) override;
++  // MacNeutron (downstream only): code buffers for code compiled from memory that isn't file-backed.
++  CPU::PoolCodeBuffers PoolCodeBuffers {*this};
+   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
+   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.cpp b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+index ed77028..45921cc 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.cpp
++++ b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+@@ -337,23 +337,59 @@ namespace CPU {
+     return nullptr;
+   }
+ 
+-  bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
+-    const auto CheckCodeBuffer = [](const CodeBuffer& Buffer, uintptr_t Address) {
+-      const auto BufferPtr = reinterpret_cast<uintptr_t>(Buffer.GetBufferBase());
+-      const uintptr_t LastPageAddr = BufferPtr + Buffer.UsableSize();
+-      return (Address >= BufferPtr && Address < LastPageAddr);
+-    };
++  static bool IsAddressInBuffer(const CodeBuffer& Buffer, uintptr_t Address) {
++    const auto BufferPtr = reinterpret_cast<uintptr_t>(Buffer.GetBufferBase());
++    const uintptr_t LastPageAddr = BufferPtr + Buffer.UsableSize();
++    return (Address >= BufferPtr && Address < LastPageAddr);
++  }
+ 
+-    if (CheckCodeBuffer(*CurrentCodeBuffer, Address)) {
++  bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
++    if (IsAddressInBuffer(*CurrentCodeBuffer, Address)) {
+       return true;
+     }
+     for (const auto& Buffer : SignalHandlerCodeBuffers) {
+-      if (CheckCodeBuffer(*Buffer, Address)) {
++      if (IsAddressInBuffer(*Buffer, Address)) {
++        return true;
++      }
++    }
++    if (CurrentPoolBuffer && IsAddressInBuffer(*CurrentPoolBuffer, Address)) {
++      return true;
++    }
++    for (const auto& Buffer : SignalHandlerPoolBuffers) {
++      if (IsAddressInBuffer(*Buffer, Address)) {
+         return true;
+       }
+     }
+     return false;
+   }
+ 
++  bool CPUBackend::IsAddressInCurrentPoolBuffer(uintptr_t Address) const {
++    return CurrentPoolBuffer && IsAddressInBuffer(*CurrentPoolBuffer, Address);
++  }
++
++  bool CPUBackend::IsAddressInCurrentMainBuffer(uintptr_t Address) const {
++    return IsAddressInBuffer(*CurrentCodeBuffer, Address);
++  }
++
++  void CPUBackend::RegisterForSignalHandlerPool(fextl::shared_ptr<CodeBuffer> CodeBuffer) {
++    if (ThreadState->CurrentFrame->SignalHandlerRefCounter != 0) {
++      SignalHandlerPoolBuffers.push_back(std::move(CodeBuffer));
++    } else {
++      SignalHandlerPoolBuffers.clear();
++    }
++  }
++
++  fextl::shared_ptr<CodeBuffer> CPUBackend::CheckPoolBufferUpdate() {
++    if (!Pool) {
++      return nullptr;
++    }
++    auto NewPoolBuffer = Pool->GetLatest();
++    if (CurrentPoolBuffer != NewPoolBuffer) {
++      RegisterForSignalHandlerPool(CurrentPoolBuffer);
++      return std::exchange(CurrentPoolBuffer, NewPoolBuffer);
++    }
++    return nullptr;
++  }
++
+ } // namespace CPU
+ } // namespace FEXCore
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 19d82ea..ad0f6f1 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -142,6 +142,27 @@ namespace CPU {
+     [[nodiscard]]
+     fextl::shared_ptr<CodeBuffer> CheckCodeBufferUpdate();
+ 
++    // MacNeutron (downstream only): set while compiling a block that goes to the pool buffer (see PoolCodeBuffers).
++    bool CompileIntoPool {};
++
++    bool PoolEnabled() const {
++      return Pool != nullptr;
++    }
++
++    // Whether Address is in the pool buffer this thread compiles into.
++    bool IsAddressInCurrentPoolBuffer(uintptr_t Address) const;
++
++    // Whether Address is in the main buffer this thread compiles into.
++    bool IsAddressInCurrentMainBuffer(uintptr_t Address) const;
++
++    // Moves to the latest pool buffer if needed and returns a reference to the old one, as CheckCodeBufferUpdate.
++    [[nodiscard]]
++    fextl::shared_ptr<CodeBuffer> CheckPoolBufferUpdate();
++
++    const fextl::shared_ptr<CodeBuffer>& GetCurrentPoolBuffer() const {
++      return CurrentPoolBuffer;
++    }
++
+   protected:
+     // Max spill slot size in bytes. We need at most 32 bytes
+     // to be able to handle a 256-bit vector store to a slot.
+@@ -162,6 +183,14 @@ namespace CPU {
+ 
+     SharedCodeBufferManager& SharedCodeBuffers;
+ 
++    // MacNeutron (downstream only): the pool buffer this thread compiles into, and old ones still needed by signal
++    // handlers. Pool is null when pool buffers are off.
++    PoolCodeBuffers* Pool {};
++    fextl::shared_ptr<CodeBuffer> CurrentPoolBuffer;
++    fextl::vector<fextl::shared_ptr<CodeBuffer>> SignalHandlerPoolBuffers;
++
++    void RegisterForSignalHandlerPool(fextl::shared_ptr<CodeBuffer>);
++
+   private:
+     void RegisterForSignalHandler(fextl::shared_ptr<CodeBuffer>);
+   };
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index e259e90..06b44ff 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -499,7 +499,10 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
+     auto lk = Thread->LookupCache->AcquireWriteLock();
+     Thread->LookupCache->ClearCache(lk);
+   }
+-  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++  // MacNeutron (downstream only): zero this thread's own call-ret stack in place. On Windows VirtualDontNeed is a
++  // VirtualFree, which notifies the frontend (ThreadCreationMutex) while CodeInvalidationMutex is held for reading here,
++  // against a thread that holds ThreadCreationMutex and waits to take CodeInvalidationMutex (a deadlock).
++  memset(Thread->CallRetStackBase, 0, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+ }
+ 
+ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter* IREmitter, uint64_t GuestRIP) {
+@@ -533,6 +536,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+       TotalInstructionsLength = 1;
+       Handler->second.Handler(GuestRIP, Thread->OpDispatcher.get());
+       HasCustomIR = true;
++      Thread->CPUBackend->CompileIntoPool = false; // MacNeutron: custom IR stays in the main buffer
+     }
+   }
+ 
+@@ -928,7 +932,11 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
+   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+ 
++  // MacNeutron (downstream only): code from memory that isn't file-backed compiles into a pool buffer (see
++  // PoolCodeBuffers); GenerateIR keeps custom IR in the main buffer.
++  Thread->CPUBackend->CompileIntoPool = Thread->CPUBackend->PoolEnabled() && !Region;
+   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
++  const bool InPool = std::exchange(Thread->CPUBackend->CompileIntoPool, false);
+   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
+   if (CodePtr == nullptr) {
+     return 0;
+@@ -988,7 +996,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     CodePages.reserve(BlockInfo->CodePages.size());
+     CodePages.insert(CodePages.end(), BlockInfo->CodePages.begin(), BlockInfo->CodePages.end());
+     for (auto CodePage : BlockInfo->CodePages) {
+-      if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
++      if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE, InPool)) {
+         SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+       }
+     }
+@@ -1011,7 +1019,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+ 
+   // Insert to lookup cache
+   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
+-    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
++    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr, InPool);
+   }
+ 
+   // Clear any relocations that might have been generated
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index d4c00b2..1941953 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -548,10 +548,15 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+     if (!HostCode) {
+       // Hold a reference to the code buffer, to avoid linking unmapped code if compilation triggers a recreation.
+       auto CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
++      // MacNeutron (downstream only): likewise for the pool buffer.
++      auto PoolBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentPoolBuffer;
+       HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
+       if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
+         return HostCode;
+       }
++      if (PoolBuffer && Thread->LookupCache->SharedPool != PoolBuffer->LookupCache.get()) {
++        return HostCode;
++      }
+     }
+   }
+ 
+@@ -560,6 +565,17 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
+   auto BranchOffset = HostCode / 4 - CallerAddress / 4;
+ 
++  // MacNeutron (downstream only): blocks are only linked within the main buffer or within the pool buffer (see
++  // PoolCodeBuffers); an exit between the two stays unlinked and comes back here each time.
++  bool PoolLink = false;
++  if (auto* Backend = static_cast<Arm64JITCore*>(Thread->CPUBackend.get()); Backend->PoolEnabled()) {
++    PoolLink = Backend->IsAddressInCurrentPoolBuffer(HostCode);
++    if (PoolLink != Backend->IsAddressInCurrentPoolBuffer(CallerAddress) ||
++        (!PoolLink && !Backend->IsAddressInCurrentMainBuffer(HostCode))) {
++      return HostCode;
++    }
++  }
++
+   uint32_t ExpectedKnownCallMarkerInst = 0;
+   ARMEmitter::Emitter ExpectedKnownCallMarkerEmit(reinterpret_cast<uint8_t*>(&ExpectedKnownCallMarkerInst), 4);
+   ExpectedKnownCallMarkerEmit.adr(TMP1, 0xC);
+@@ -570,42 +586,51 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+   // Lock here is necessary to prevent simultaneous linking and delinking
+   auto lk = Thread->LookupCache->AcquireWriteLock();
+ 
+-  // For non-calls, this would extend into the block's code, however that's fine as an out-of-range adr would never
+-  // be generated avoiding any false positives.
+-  uintptr_t KnownCallMarkerAddr = CallerAddress - 0x8;
+-  uint32_t KnownCallMarkerInst = *reinterpret_cast<uint32_t*>(KnownCallMarkerAddr);
+-  if (ARMEmitter::Emitter::IsInt26(BranchOffset)) {
+-    // Directly patch the callsite with the appropriate branch instruction.
+-    uint32_t BranchInst = 0;
+-    ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
+-
+-    if (KnownCallMarkerInst == ExpectedKnownCallMarkerInst) {
+-      BranchEmit.bl(BranchOffset);
+-      Thread->LookupCache->AddBlockLink(
+-        GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, true); }, lk);
+-    } else {
+-      BranchEmit.b(BranchOffset);
+-      Thread->LookupCache->AddBlockLink(
+-        GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, false); }, lk);
+-    }
++  // Patches the caller and records the link in Map, whose write lock MapLock is.
++  const auto Link = [&](GuestToHostMap& Map, const LookupCacheWriteLockToken& MapLock) {
++    // For non-calls, this would extend into the block's code, however that's fine as an out-of-range adr would never
++    // be generated avoiding any false positives.
++    uintptr_t KnownCallMarkerAddr = CallerAddress - 0x8;
++    uint32_t KnownCallMarkerInst = *reinterpret_cast<uint32_t*>(KnownCallMarkerAddr);
++    if (ARMEmitter::Emitter::IsInt26(BranchOffset)) {
++      // Directly patch the callsite with the appropriate branch instruction.
++      uint32_t BranchInst = 0;
++      ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
++
++      if (KnownCallMarkerInst == ExpectedKnownCallMarkerInst) {
++        BranchEmit.bl(BranchOffset);
++        Map.AddBlockLink(GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, true); }, MapLock);
++      } else {
++        BranchEmit.b(BranchOffset);
++        Map.AddBlockLink(GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, false); }, MapLock);
++      }
+ 
+-    std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(CallerAddress))).store(BranchInst, std::memory_order::relaxed);
+-    ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
+-  } else {
+-    // This case is common between calls and jumps as the thunk callsite can be left untouched.
+-    std::atomic_ref<uint64_t>(ARMEmitter::DualMap::WriteAddr(Record)->HostCode).store(HostCode, std::memory_order::seq_cst);
++      std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(CallerAddress))).store(BranchInst, std::memory_order::relaxed);
++      ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
++    } else {
++      // This case is common between calls and jumps as the thunk callsite can be left untouched.
++      std::atomic_ref<uint64_t>(ARMEmitter::DualMap::WriteAddr(Record)->HostCode).store(HostCode, std::memory_order::seq_cst);
+ #ifdef ARCHITECTURE_arm64
+-    // Make memory write visible to other threads reading the same location
+-    asm volatile("dc cvau, %0; dsb ish" : : "r"(Record->HostCode) :);
++      // Make memory write visible to other threads reading the same location
++      asm volatile("dc cvau, %0; dsb ish" : : "r"(Record->HostCode) :);
+ #endif
+ 
+-    uint32_t LdrInst = 0;
+-    ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
+-    LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
+-    std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress))).store(LdrInst, std::memory_order::relaxed);
+-    ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
++      uint32_t LdrInst = 0;
++      ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
++      LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
++      std::atomic_ref<uint32_t>(*ARMEmitter::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress))).store(LdrInst, std::memory_order::relaxed);
++      ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+ 
+-    Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
++      Map.AddBlockLink(GuestRip, Record, IndirectBlockDelinker, MapLock);
++    }
++  };
++
++  if (PoolLink) {
++    // The pool map's lock keeps its delinking out while linking. Lock order: main map, then pool map.
++    auto PoolLock = Thread->LookupCache->SharedPool->AcquireWriteLock();
++    Link(*Thread->LookupCache->SharedPool, PoolLock);
++  } else {
++    Link(*Thread->LookupCache->Shared, lk);
+   }
+ 
+   return HostCode;
+@@ -668,6 +693,40 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
+ 
+   CurrentCodeBuffer = SharedCodeBuffers.GetLatest();
+   ThreadState->LookupCache->Shared = CurrentCodeBuffer->LookupCache.get();
++
++  // MacNeutron (downstream only): code from memory that isn't file-backed goes to pool buffers (see PoolCodeBuffers).
++  if (ctx->PoolCodeBuffers.Enabled()) {
++    Pool = &ctx->PoolCodeBuffers;
++    CurrentPoolBuffer = Pool->GetLatest();
++    auto lk = ThreadState->LookupCache->AcquireWriteLock();
++    ThreadState->LookupCache->ChangePoolMapping(nullptr, *CurrentPoolBuffer->LookupCache, lk);
++  }
++}
++
++void Arm64JITCore::SwitchPoolMapping(CodeBuffer* Prev) {
++  // As for a new main buffer: this thread's L1, L2 and call-ret stack may point into the old pool buffer.
++  // MacNeutron (downstream only): zero this thread's own call-ret stack in place. On Windows VirtualDontNeed is a
++  // VirtualFree, which notifies the frontend (ThreadCreationMutex) while CodeInvalidationMutex is held for reading here,
++  // against a thread that holds ThreadCreationMutex and waits to take CodeInvalidationMutex (a deadlock).
++  memset(ThreadState->CallRetStackBase, 0, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++  auto lk = ThreadState->LookupCache->AcquireWriteLock();
++  ThreadState->LookupCache->ChangePoolMapping(Prev, *CurrentPoolBuffer->LookupCache, lk);
++}
++
++CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInPool(size_t Size) {
++  for (;;) {
++    auto AllocatedInfo = CurrentPoolBuffer->AtomicAllocateBuffer(Size);
++    if (AllocatedInfo.BufferAllocationOffset != nullptr) {
++      return AllocatedInfo;
++    }
++
++    // Full: start a new pool buffer (or move to the one another thread just started). Nothing outside a pool buffer
++    // links into it, so the old one is released once no thread holds it.
++    auto Prev = CurrentPoolBuffer;
++    CurrentPoolBuffer = Pool->StartNew(Prev.get());
++    RegisterForSignalHandlerPool(Prev);
++    SwitchPoolMapping(Prev.get());
++  }
+ }
+ 
+ void Arm64JITCore::ClearCache() {
+@@ -815,12 +874,25 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
+ 
+ 
+ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(size_t Size) {
++  // MacNeutron (downstream only): move to the latest pool buffer at every compile, so that old ones are released.
++  if (Pool) {
++    if (auto Prev = CheckPoolBufferUpdate()) {
++      SwitchPoolMapping(Prev.get());
++    }
++    if (CompileIntoPool) {
++      return AllocateCodeBufferInPool(Size);
++    }
++  }
++
+   CodeBuffer::CodeBufferAllocation AllocatedInfo {};
+   LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
+                                                                                                "doesn't match up!\n");
+   // Bring CodeBuffer up to date
+   if (auto Prev = CheckCodeBufferUpdate()) {
+-    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++    // MacNeutron (downstream only): zero this thread's own call-ret stack in place. On Windows VirtualDontNeed is a
++    // VirtualFree, which notifies the frontend (ThreadCreationMutex) while CodeInvalidationMutex is held for reading here,
++    // against a thread that holds ThreadCreationMutex and waits to take CodeInvalidationMutex (a deadlock).
++    memset(ThreadState->CallRetStackBase, 0, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+     auto lk = ThreadState->LookupCache->AcquireWriteLock();
+     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+   }
+@@ -1115,7 +1187,8 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+       EntryPoint.second += Delta;
+     }
+     CodeBegin += Delta;
+-    CodeData.HostCodeOffset = CodeData.BlockBegin - CurrentCodeBuffer->GetBufferBase();
++    // MacNeutron: relative to the buffer it went to, which may be a pool buffer.
++    CodeData.HostCodeOffset = CodeData.BlockBegin - AllocatedInfo.BufferBase;
+ 
+     // Copy over CodeBuffer contents
+     memcpy(ARMEmitter::DualMap::WriteAddr(AllocatedInfo.BufferAllocationOffset), TempCodeBuffer, CodeData.Size);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index e42e6cb..bf66cf7 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -628,6 +628,9 @@ private:
+   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
+ 
+   [[nodiscard]] CodeBuffer::CodeBufferAllocation AllocateCodeBufferInSharedCache(size_t Size);
++  // MacNeutron (downstream only): pool buffers, see PoolCodeBuffers.
++  [[nodiscard]] CodeBuffer::CodeBufferAllocation AllocateCodeBufferInPool(size_t Size);
++  void SwitchPoolMapping(CodeBuffer* Prev);
+ 
+ #define DEF_OP(x) void Op_##x(IR::IROp_Header const* IROp, IR::Ref Node)
+ 
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index bf958d8..c2d1d06 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -173,6 +173,15 @@ public:
+     Shared = &NewMap;
+   }
+ 
++  // MacNeutron (downstream only): the same for the pool buffer's map (see PoolCodeBuffers). Prev may be null for the
++  // first pool buffer. lk is the main map's write lock, which guards this thread's L1 and L2.
++  void ChangePoolMapping([[maybe_unused]] CPU::CodeBuffer* Prev, GuestToHostMap& NewMap, const LookupCacheWriteLockToken& lk) {
++    if (Prev) {
++      ClearThreadLocalCaches(lk);
++    }
++    SharedPool = &NewMap;
++  }
++
+   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+     // Try L1, no lock needed
+     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+@@ -217,6 +226,16 @@ public:
+           HostPtr = Entry->HostCode;
+         }
+       }
++
++      if (!HostPtr && SharedPool) {
++        // MacNeutron (downstream only): then the pool buffer's map. Lock order: main map, then pool map.
++        auto PoolLock = SharedPool->AcquireReadLock();
++        auto Entry = SharedPool->FindBlock(Address, PoolLock);
++        if (Entry) {
++          CacheBlockMapping(Address, *Entry, false, lk);
++          HostPtr = Entry->HostCode;
++        }
++      }
+     }
+ 
+     if (HostPtr && DynamicL1Cache()) {
+@@ -272,12 +291,21 @@ public:
+   }
+ 
+   GuestToHostMap* Shared = nullptr;
++  // MacNeutron (downstream only): the map of the pool buffer this thread compiles into, or null.
++  GuestToHostMap* SharedPool = nullptr;
+ 
+   // Appends a list of Block {Address} to CodePages [Start, Start + Length)
+   // Returns true if new pages are marked as containing code
+-  bool AddBlockExecutableRange(FEXCore::Core::InternalThreadState* Thread, const fextl::set<uint64_t>& Addresses, uint64_t Start, uint64_t Length) {
++  // MacNeutron: Pool selects the pool buffer's map.
++  bool AddBlockExecutableRange(FEXCore::Core::InternalThreadState* Thread, const fextl::set<uint64_t>& Addresses, uint64_t Start,
++                               uint64_t Length, bool Pool = false) {
+     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
+       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
++    if (Pool) {
++      auto lk = SharedPool->AcquireWriteLock();
++      LockTime.reset();
++      return SharedPool->AddBlockExecutableRange(Addresses, Start, Length, lk);
++    }
+     auto lk = Shared->AcquireWriteLock();
+     LockTime.reset();
+ 
+@@ -285,12 +313,22 @@ public:
+   }
+ 
+   // Adds to Guest -> Host code mapping
+-  void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, const fextl::vector<uint64_t>& CodePages, void* HostCode) {
++  // MacNeutron: Pool selects the pool buffer's map.
++  void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, const fextl::vector<uint64_t>& CodePages,
++                       void* HostCode, bool Pool = false) {
+     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
+       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
+     auto lk = Shared->AcquireWriteLock();
+     LockTime.reset();
+ 
++    if (Pool) {
++      // Lock order: main map (guards L1 and L2), then pool map.
++      auto PoolLock = SharedPool->AcquireWriteLock();
++      const auto& Entry = SharedPool->AddBlockMapping(Address, CodePages, HostCode, PoolLock);
++      CacheBlockMapping(Address, Entry, true, lk);
++      return;
++    }
++
+     const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
+ 
+     // There is no need to update L1 or L2, they will get updated on first lookup
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index dff5c97..bc3d569 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -1,4 +1,5 @@
+ // SPDX-License-Identifier: MIT
++#include <cstdlib>
+ #include "Interface/Core/LookupCache.h"
+ #include "Interface/Core/SharedCodeBufferManager.h"
+ 
+@@ -100,4 +101,33 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
+ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {
+   return AllocateNew(MAX_CODE_SIZE);
+ }
++
++PoolCodeBuffers::PoolCodeBuffers(SharedCodeBufferManager& Registry)
++  : Registry {Registry} {
++  // MACNEUTRON_POOL_BUFFER_MB: the size of each pool buffer; 0 or unset puts all code in the main buffers.
++  if (const char* Value = getenv("MACNEUTRON_POOL_BUFFER_MB")) {
++    Size = std::min<size_t>(strtoull(Value, nullptr, 10), 1024) * 1024 * 1024;
++    if (Size && Size < 16 * 1024 * 1024) {
++      Size = 16 * 1024 * 1024;
++    }
++  }
++}
++
++fextl::shared_ptr<CodeBuffer> PoolCodeBuffers::GetLatest() {
++  std::scoped_lock Guard(Lock);
++  if (!Latest) {
++    Latest = fextl::make_shared<CodeBuffer>(Size);
++    Registry.OnCodeBufferAllocated(Latest);
++  }
++  return Latest;
++}
++
++fextl::shared_ptr<CodeBuffer> PoolCodeBuffers::StartNew(const CodeBuffer* Full) {
++  std::scoped_lock Guard(Lock);
++  if (!Latest || Latest.get() == Full) {
++    Latest = fextl::make_shared<CodeBuffer>(Size);
++    Registry.OnCodeBufferAllocated(Latest);
++  }
++  return Latest;
++}
+ } // namespace FEXCore::CPU
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+index c047eb8..4bdeeed 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+@@ -14,6 +14,7 @@ $end_info$
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <mutex>
+ 
+ namespace FEXCore {
+ struct GuestToHostMap;
+@@ -132,4 +133,37 @@ private:
+ 
+   fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);
+ };
++
++/**
++ * MacNeutron (downstream only, not for upstream FEX): code buffers for code compiled from memory that isn't
++ * file-backed.
++ *
++ * Anti-tamper code that keeps writing new arrangements of relocated instructions into private memory (Age of Empires
++ * II: Definitive Edition, ~10 MB of new host code a second) fills the shared code buffer every few seconds, and each
++ * refill makes every thread recompile its working set. Such code goes to pool buffers of a fixed size instead, so it
++ * no longer fills the main one. A full pool buffer is replaced by a new one; threads move to it at their next
++ * compile, as they do between main buffers, and an old one lives while a thread still holds it. Blocks are never
++ * linked between a pool buffer and a main one, so no code outside a pool buffer can jump into one a thread no
++ * longer holds.
++ */
++class PoolCodeBuffers {
++public:
++  explicit PoolCodeBuffers(SharedCodeBufferManager& Registry);
++
++  bool Enabled() const {
++    return Size != 0;
++  }
++
++  // The pool buffer to compile into, allocated on first use.
++  fextl::shared_ptr<CodeBuffer> GetLatest();
++
++  // Replaces Full with a new pool buffer, unless another thread already did.
++  fextl::shared_ptr<CodeBuffer> StartNew(const CodeBuffer* Full);
++
++private:
++  SharedCodeBufferManager& Registry;
++  size_t Size {};
++  std::mutex Lock;
++  fextl::shared_ptr<CodeBuffer> Latest;
++};
+ } // namespace FEXCore::CPU
+diff --git a/FEXCore/Source/Utils/Allocator.cpp b/FEXCore/Source/Utils/Allocator.cpp
+index 94c5b06..18b96e5 100644
+--- a/FEXCore/Source/Utils/Allocator.cpp
++++ b/FEXCore/Source/Utils/Allocator.cpp
+@@ -315,6 +315,7 @@ VirtualNamePtr VirtualName {VirtualNameNOP};
+ VirtualTHPPtr VirtualTHPControl {VirtualTHPNOP};
+ AllocExecPtr AllocExec;
+ FreeExecPtr FreeExec;
++SuppressMemoryNotificationsPtr SuppressMemoryNotifications;
+ 
+ void SetupHooks(size_t PageSize, HookPtrs Ptrs) {
+   VirtualName = Ptrs.VirtualName;
+diff --git a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+index e3ea473..e0ff10e 100644
+--- a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
++++ b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+@@ -54,6 +54,13 @@ FEX_DEFAULT_VISIBILITY void ClearHooks();
+ #ifdef _WIN32
+ FEX_DEFAULT_VISIBILITY extern AllocExecPtr AllocExec;
+ FEX_DEFAULT_VISIBILITY extern FreeExecPtr FreeExec;
++// MacNeutron (downstream only): set by the ARM64EC frontend. Turns the frontend's memory notifications for this thread
++// off (true) or back on (false) and returns whether they were off. FEX's own memory never holds guest code, and a
++// notification takes the frontend's ThreadCreationMutex, which deadlocks when FEX frees memory while holding
++// CodeInvalidationMutex for reading (a code buffer switch clears the L1/L2 caches) against a thread that holds
++// ThreadCreationMutex and waits to take CodeInvalidationMutex.
++using SuppressMemoryNotificationsPtr = bool (*)(bool Suppress);
++FEX_DEFAULT_VISIBILITY extern SuppressMemoryNotificationsPtr SuppressMemoryNotifications;
+ 
+ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
+   if (Execute && !Base && AllocExec) {
+@@ -89,12 +96,17 @@ inline void VirtualFree(void* Ptr, size_t Size) {
+ 
+ inline void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true) {
+   // Zero the page-aligned region, preserving permissions.
++  // MacNeutron: without the frontend's memory notifications, see SuppressMemoryNotifications.
++  const bool Prev = SuppressMemoryNotifications ? SuppressMemoryNotifications(true) : false;
+   MEMORY_BASIC_INFORMATION Info;
+   ::VirtualQuery(Ptr, &Info, sizeof(Info));
+   ::VirtualFree(Ptr, Size, MEM_DECOMMIT);
+   if (Recommit) {
+     ::VirtualAlloc(Ptr, Size, MEM_COMMIT, Info.Protect);
+   }
++  if (SuppressMemoryNotifications) {
++    SuppressMemoryNotifications(Prev);
++  }
+ }
+ 
+ inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 9f33e32..dc4622c 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -632,6 +632,13 @@ NTSTATUS ProcessInit() {
+ 
+   FEX::Windows::Allocator::SetupHooks(NtDll);
+   FEX::Windows::UnixLib::Init(NtDll);
++  // MacNeutron (downstream only): FEX's own decommits don't notify the frontend (see SuppressMemoryNotifications).
++  FEXCore::Allocator::SuppressMemoryNotifications = [](bool Suppress) {
++    const auto CPUArea = GetCPUArea();
++    const bool Prev = CPUArea.Area->InSyscallCallback;
++    CPUArea.Area->InSyscallCallback = Suppress;
++    return Prev;
++  };
+ 
+   {
+     auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec);

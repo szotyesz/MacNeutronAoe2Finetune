@@ -3,10 +3,12 @@
 // queues. Checks: every size; an immediate return when the value differs; timeouts, zero included; a single wake
 // wakes one of two 4- or 8-byte waiters (at least one 1- or 2-byte waiter: those wait on their 4-byte word, so a
 // single wake there wakes them all, which WaitOnAddress allows as spurious wakeups) and a wake-all every waiter; a
-// misaligned 8-byte address; 4- and 8-byte waiters on one address; and SRW locks and condition variables under
-// contention, which use WaitOnAddress, finish.
+// misaligned 8-byte address; 4- and 8-byte waiters on one address; SRW locks and condition variables under
+// contention, which use WaitOnAddress, finish; and a lock with whole-word and half-word waiters loses no wakeup.
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #if defined(__x86_64__) && !defined(__arm64ec__)
 #define NAME "x64-waitaddr"  // the same source built for x64 (Makefile), under FEX
@@ -144,8 +146,124 @@ static void contention(void) {
   for (int i = 0; i < 8; i++) CloseHandle(h[i]);
 }
 
-int main(void) {
+// 6. A lock whose writers wait on the whole 4-byte word and whose readers wait on its upper half, as FEX's code
+// invalidation lock (WritePriorityMutex) does: the last reader to leave wakes one writer. Readers sleep on the same
+// kernel word as the writers, and a reader whose half did not change must not take the wake meant for a writer
+// (AoE2DE's start-up hangs, 2026-10-09). A writer that waits 2 s while the lock is free counts as a lost wakeup.
+#define RW_WRITE_OWNED 0x80000000u
+#define RW_READ_WAITER 0x40000000u
+#define RW_WRITER_INC 0x00010000u
+#define RW_WRITERS 0x3fff0000u
+#define RW_READERS 0x0000ffffu
+static __declspec(align(16)) volatile LONG rw;
+static volatile LONG rw_stop, rw_lost, rw_writes, rw_reads;
+static int rw_reader_hold = 2000, rw_writer_pause = 2000, rw_threads = 12;
+
+static void rw_lock(void) {
+  ULONG v = (ULONG)InterlockedExchangeAdd(&rw, RW_WRITER_INC) + RW_WRITER_INC;
+  for (;;) {
+    if (!(v & RW_WRITE_OWNED) && !(v & RW_READERS)) {
+      ULONG prev = (ULONG)InterlockedCompareExchange(&rw, (LONG)((v | RW_WRITE_OWNED) - RW_WRITER_INC), (LONG)v);
+      if (prev == v) return;
+      v = prev;
+      continue;
+    }
+    if (!WaitOnAddress(&rw, &v, 4, 2000) && GetLastError() == ERROR_TIMEOUT) {
+      ULONG now = (ULONG)rw;
+      if (!(now & RW_WRITE_OWNED) && !(now & RW_READERS)) InterlockedIncrement(&rw_lost);
+    }
+    v = (ULONG)rw;
+  }
+}
+
+static void rw_unlock(void) {
+  ULONG v = (ULONG)rw, prev, want;
+  for (;;) {
+    want = v & ~RW_WRITE_OWNED;
+    if (!(want & RW_WRITERS)) want &= ~RW_READ_WAITER;
+    prev = (ULONG)InterlockedCompareExchange(&rw, (LONG)want, (LONG)v);
+    if (prev == v) break;
+    v = prev;
+  }
+  if (v & RW_WRITERS) WakeByAddressSingle((void *)&rw);
+  else if (v & RW_READ_WAITER) WakeByAddressAll((BYTE *)&rw + 2);
+}
+
+static void rd_lock(void) {
+  ULONG v = (ULONG)rw;
+  for (;;) {
+    ULONG prev;
+    USHORT upper;
+    if (!(v & RW_WRITE_OWNED) && !(v & RW_WRITERS)) {
+      prev = (ULONG)InterlockedCompareExchange(&rw, (LONG)(v + 1), (LONG)v);
+      if (prev == v) return;
+      v = prev;
+      continue;
+    }
+    prev = (ULONG)InterlockedCompareExchange(&rw, (LONG)(v | RW_READ_WAITER), (LONG)v);
+    if (prev != v) {
+      v = prev;
+      continue;
+    }
+    upper = (USHORT)((v | RW_READ_WAITER) >> 16);
+    WaitOnAddress((BYTE *)&rw + 2, &upper, 2, 2000);
+    v = (ULONG)rw;
+  }
+}
+
+static void rd_unlock(void) {
+  ULONG v = (ULONG)InterlockedDecrement(&rw);
+  if ((v & RW_WRITERS) && !(v & RW_READERS)) WakeByAddressSingle((void *)&rw);
+}
+
+static DWORD WINAPI rw_writer(void *arg) {
+  (void)arg;
+  while (!rw_stop) {
+    rw_lock();
+    rw_writes++;
+    rw_unlock();
+    for (volatile int i = 0; i < rw_writer_pause; i++) {
+    }
+  }
+  return 0;
+}
+
+static DWORD WINAPI rw_reader(void *arg) {
+  (void)arg;
+  while (!rw_stop) {
+    rd_lock();
+    InterlockedIncrement(&rw_reads);
+    for (volatile int i = 0; i < rw_reader_hold; i++) {
+    }
+    rd_unlock();
+  }
+  return 0;
+}
+
+static void shared_word(DWORD ms) {
+  HANDLE h[64];
+  rw = 0;
+  rw_stop = rw_lost = rw_writes = rw_reads = 0;
+  for (int i = 0; i < rw_threads; i++) h[i] = CreateThread(NULL, 0, i < 3 ? rw_writer : rw_reader, NULL, 0, NULL);
+  Sleep(ms);
+  rw_stop = 1;
+  CHECK(WaitForMultipleObjects(rw_threads, h, TRUE, 10000) == WAIT_OBJECT_0, "shared word: the threads did not finish");
+  printf("shared word: %ld writes, %ld reads in %lu ms, %ld lost wakeups\n", rw_writes, rw_reads, ms, rw_lost);
+  CHECK(rw_lost == 0, "shared word: %ld writer wakeups lost", rw_lost);
+  for (int i = 0; i < rw_threads; i++) CloseHandle(h[i]);
+}
+
+int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
+  if (argc > 2 && !strcmp(argv[1], "shared")) {  // the shared-word case alone: shared <seconds> [hold] [pause]
+    if (argc > 3) rw_reader_hold = atoi(argv[3]);
+    if (argc > 4) rw_writer_pause = atoi(argv[4]);
+    if (argc > 5) rw_threads = min(max(atoi(argv[5]), 4), 64);
+    printf("reader hold %d, writer pause %d\n", rw_reader_hold, rw_writer_pause);
+    shared_word(atoi(argv[2]) * 1000);
+    printf("%s " NAME "\n", fails ? "FAIL" : "PASS");
+    return !!fails;
+  }
   sizes();
   timeouts();
   single_and_all(4, mem, "4 bytes");
@@ -154,6 +272,7 @@ int main(void) {
   single_and_all(2, mem, "2 bytes");
   mixed_sizes();
   contention();
+  shared_word(5000);
   if (fails) {
     printf("FAIL " NAME " (%d)\n", fails);
     return 1;

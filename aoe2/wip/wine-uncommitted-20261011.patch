@@ -1,0 +1,181 @@
+Uncommitted Wine changes on 2026-10-11, saved so they aren't lost; not part of the build's patch series.
+Base: the Wine tree with wine-arm64/patches/wine 0001-0027 applied (commit 199cab0 in build/wine-arm64-src/wine).
+Apply with: git -C build/wine-arm64-src/wine apply aoe2/wip/wine-uncommitted-20261011.patch
+- dlls/ntdll/sync.c: the lost-wakeup fix for patch 0025 (HANDOFF §4 item 6); test in wine-arm64/tests/arm64ec-waitaddr.c.
+- dlls/ntdll/unix/loader.c: realpath the loader on macOS, so Wine processes get wine.app's bundle ID (Game Mode).
+- dlls/win32u/vulkan.c, dlls/winemac.drv: letterbox experiments (HANDOFF §4 item 1, dropped; not proven).
+Not in it: the macOS get_thread_times and ARM64EC NtGetContextThread flag fixes from 2026-10-10 (HANDOFF §4 item 5).
+
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 67765a4..752100b 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -849,16 +849,22 @@ static struct futex_queue *get_futex_queue( const void *addr )
+  * another thread's wait or wake. The kernel waits on 4- and 8-byte values; a 1- or 2-byte wait waits on the aligned
+  * 4-byte word that holds it, so any change to that word wakes it (a spurious wakeup when another part changed). A
+  * single wake on a word such sub-word waiters may share wakes all of its waiters, since the kernel cannot tell which
+- * of them it was meant for. The futex queues serve what the kernel refuses (a value across a word boundary, an
+- * address waited on with another size); a wake looks at them only while they have waiters.
++ * of them it was meant for: a sub-word waiter whose part of the word did not change would take the wake and sleep
++ * again, and the waiter it was meant for would sleep on (a writer of FEX's code invalidation lock, which waits on
++ * the whole word while its readers wait on the upper half). So a single wake wakes them all while the word's hash
++ * bucket has sub-word waiters, or when one started waiting there while the wake went out. The futex queues serve
++ * what the kernel refuses (a value across a word boundary, an address waited on with another size); a wake looks at
++ * them only while they have waiters.
+  * kernel_waiters counts the kernel waiters by size and by the futex queues' hash of the kernel address, sub_waiters
+- * the sub-word ones among the 4-byte waiters: a wake on an address nobody can be waiting on makes no system call. */
++ * the sub-word ones among the 4-byte waiters, and sub_starts the sub-word waits ever started: a wake on an address
++ * nobody can be waiting on makes no system call. */
+ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size );
+ 
+ static BOOL kernel_waits = TRUE;
+ static LONG queue_waiters;
+ static LONG kernel_waiters[2][ARRAY_SIZE(futex_queues)];  /* 4- and 8-byte kernel waits */
+ static LONG sub_waiters[ARRAY_SIZE(futex_queues)];
++static LONG sub_starts[ARRAY_SIZE(futex_queues)];
+ 
+ static unsigned int kernel_bucket( const void *addr )
+ {
+@@ -883,7 +889,15 @@ static void wake_kernel_waiters( const void *addr, BOOL all )
+     if (!kernel_waits) return;
+     if (ReadNoFence( &kernel_waiters[0][bucket] )) sizes |= 4;
+     if (ReadNoFence( &kernel_waiters[1][bucket] )) sizes |= 8;
+-    if (sizes) kernel_wake( addr, sizes, all || ReadNoFence( &sub_waiters[bucket] ));
++    if (sizes)
++    {
++        LONG starts = ReadAcquire( &sub_starts[bucket] );
++        BOOL shared = all || ReadNoFence( &sub_waiters[bucket] );
++
++        kernel_wake( addr, sizes, shared );
++        /* A sub-word waiter that went to sleep on this word after the check above may have taken the wake. */
++        if (!shared && (sizes & 4) && ReadAcquire( &sub_starts[bucket] ) != starts) kernel_wake( addr, 4, TRUE );
++    }
+     if ((ULONG_PTR)addr & 3)
+     {
+         const void *word = (const void *)((ULONG_PTR)addr & ~(ULONG_PTR)3);
+@@ -922,7 +936,11 @@ static NTSTATUS kernel_wait( const void *addr, const void *cmp, SIZE_T size, con
+ 
+     bucket = kernel_bucket( params.addr );
+     InterlockedIncrement( &kernel_waiters[params.size == 8][bucket] );
+-    if (sub) InterlockedIncrement( &sub_waiters[bucket] );
++    if (sub)
++    {
++        InterlockedIncrement( &sub_waiters[bucket] );
++        InterlockedIncrement( &sub_starts[bucket] );  /* after sub_waiters: see wake_kernel_waiters() */
++    }
+     ret = WINE_UNIX_CALL( unix_wait_on_address, &params );
+     if (sub) InterlockedDecrement( &sub_waiters[bucket] );
+     InterlockedDecrement( &kernel_waiters[params.size == 8][bucket] );
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index e476231..721f23c 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -433,7 +433,14 @@ static void init_paths(void)
+         if (!(dll_dir = remove_tail( ntdll_dir, get_so_dir(current_machine) ))) dll_dir = ntdll_dir;
+         bin_dir = build_relative_path( dll_dir, LIBDIR "/wine", BINDIR );
+         data_dir = build_relative_path( dll_dir, LIBDIR "/wine", DATADIR "/wine" );
+-        wineloader = build_path( ntdll_dir, "wine" );
++        char *loader = build_path( ntdll_dir, "wine" );
++#ifdef __APPLE__
++        /* In an app bundle this is a symlink to Contents/MacOS/wine: exec the bundle's own executable, so that
++         * Launch Services sees every Wine process as the bundle's (its Info.plist, e.g. the game category). */
++        char *real = realpath( loader, NULL );
++        if (real) { free( loader ); loader = real; }
++#endif
++        wineloader = loader;
+     }
+ #if defined(__APPLE__) && defined(__aarch64__)
+     loader_is_entitled( wineloader );  /* before any fork */
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index f07e78a..37f9d4a 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1848,6 +1848,32 @@ static BOOL is_color_space_supported( struct vulkan_physical_device *physical_de
+     return i < format_count;
+ }
+ 
++/* How to present an image whose size differs from the window's: keeping its aspect ratio, centred, where the host
++ * supports it (as a display's scaler would show an emulated display mode), else stretched. */
++static VkPresentScalingFlagsEXT get_present_scaling( struct vulkan_physical_device *physical_device, VkSurfaceKHR host_surface,
++                                                     VkPresentModeKHR present_mode, VkPresentGravityFlagsEXT *gravity )
++{
++    struct vulkan_instance *instance = physical_device->instance;
++    VkSurfacePresentModeEXT mode = {.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT, .presentMode = present_mode};
++    VkPhysicalDeviceSurfaceInfo2KHR info = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, .pNext = &mode,
++                                            .surface = host_surface};
++    VkSurfacePresentScalingCapabilitiesEXT scaling = {.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT};
++    VkSurfaceCapabilities2KHR capabilities = {.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, .pNext = &scaling};
++
++    *gravity = 0;
++    if (!instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR ||
++        instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR( physical_device->host.physical_device, &info, &capabilities ))
++        return VK_PRESENT_SCALING_STRETCH_BIT_EXT;
++    if ((scaling.supportedPresentScaling & VK_PRESENT_SCALING_ASPECT_RATIO_STRETCH_BIT_EXT) &&
++        (scaling.supportedPresentGravityX & VK_PRESENT_GRAVITY_CENTERED_BIT_EXT) &&
++        (scaling.supportedPresentGravityY & VK_PRESENT_GRAVITY_CENTERED_BIT_EXT))
++    {
++        *gravity = VK_PRESENT_GRAVITY_CENTERED_BIT_EXT;
++        return VK_PRESENT_SCALING_ASPECT_RATIO_STRETCH_BIT_EXT;
++    }
++    return VK_PRESENT_SCALING_STRETCH_BIT_EXT;
++}
++
+ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
+                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
+ {
+@@ -1892,10 +1918,15 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+     get_win_monitor_dpi( surface->hwnd, &raw_dpi );
+     if (get_surface_rect( surface->hwnd, &client_rect, raw_dpi ) &&
+         !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
+-        instance->extensions.has_VK_EXT_surface_maintenance1 &&
+-        physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
++        (instance->extensions.has_VK_EXT_surface_maintenance1 || instance->extensions.has_VK_KHR_surface_maintenance1) &&
++        (device->extensions.has_VK_EXT_swapchain_maintenance1 || device->extensions.has_VK_KHR_swapchain_maintenance1))
+     {
+-        scaling.scalingBehavior = VK_PRESENT_SCALING_STRETCH_BIT_EXT;
++        VkPresentGravityFlagsEXT gravity;
++
++        scaling.scalingBehavior = get_present_scaling( physical_device, surface->obj.host.surface,
++                                                       create_info->presentMode, &gravity );
++        scaling.presentGravityX = scaling.presentGravityY = gravity;
++        scaling.pNext = create_info_host.pNext;
+         create_info_host.pNext = &scaling;
+     }
+ 
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 3cad3e1..4f37dab 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -869,6 +869,9 @@ - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device
+             _device = [device retain];
+             self.wantsLayer = YES;
+             self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
++            /* An image of another aspect than the view (an emulated display mode) keeps its own, centred on black.
++             * AppKit sets the layer's contentsGravity from this, so the Vulkan driver can't. */
++            self.layerContentsPlacement = NSViewLayerContentsPlacementScaleProportionallyToFit;
+         }
+         return self;
+     }
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index bdcfb57..fef9a81 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1951,9 +1951,17 @@ void macdrv_app_activated(void)
+  */
+ void macdrv_app_deactivated(void)
+ {
++    HWND foreground = NtUserGetForegroundWindow();
++    DWORD pid = 0;
++
+     NtUserClipCursor(NULL);
+ 
+-    if (get_active_window() == NtUserGetForegroundWindow())
++    /* Another Mac app is now in front: no window of this process is in the foreground any more, as on Windows
++     * after a switch to another program. Not only when it's this thread's active window: every thread gets this
++     * event, and a game's window thread may not be the one whose active window it is. */
++    if (foreground && foreground != NtUserGetDesktopWindow())
++        NtUserGetWindowThread( foreground, &pid );
++    if (get_active_window() == foreground || pid == GetCurrentProcessId())
+     {
+         TRACE("setting fg to desktop\n");
+         NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
