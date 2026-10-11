@@ -205,56 +205,42 @@ State on 2026-10-09; details in the session plan (`declarative-splashing-hammock
    - **Built (uncommitted FEX change, downstream only):** pool code compiles into separate, recycled pool buffers
      (`MACNEUTRON_POOL_BUFFER_MB`; the game prefix's `HKCU\Environment` has 128, plus `MACNEUTRON_CODE_BUFFER_MB`
      128). At the menu: no main-buffer refills after start-up, CPU ~57–85% (was ~95–125%). `x64-poolchurn` and 16
-     x64 tests pass. Waiting for the user's play test; item 5 cuts sessions short until it is solved.
+     x64 tests pass. Waiting for the user's play test, now possible in full sessions (item 5 is fixed).
 3. **Other renderers than DXMT?** The rendering problems are still there, and the game feels a little sluggish.
    - **Chosen: DXVK 3.1.1 (ARM64EC) on KosmicKrisp** (Mesa's Vulkan on Metal): text renders right (user, 2026-10-08).
      wined3d has no feature level on macOS's OpenGL. Not yet in the normal build.
 4. **Integrate CaptureAge.** On Linux this works through a wrapper exe that starts both AoE2DE and CaptureAge, so they
    run in the same environment (the same Proton prefix and session) and can share resources. Do the same here.
-5. **The game quits on its own 1.5–4 min after launch** (user, 2026-10-09/10: "It exited on its own. No need for
-   cmd tab"). Active or in the background, DXMT or DXVK, with or without the pool-buffer FEX patch. Not a regression:
-   every session since 2026-10-08 that wasn't killed ended this way. Investigated 2026-10-10 (paused, open):
-   - **What ends it:** the game's anti-tamper protection, not a crash or the hang reporter. It arms a delayed
-     termination within the first second after launch (threads starting at `AoE2DE_s.exe+2C18ED4`). After a random
-     90–210 s one of them suspends the other threads, writes a file and calls `NtTerminateProcess(-1, 0)`. No other
-     thread signals or cancels it. So the trigger is a start-up check that fails deterministically in our
-     environment, and on a clean Windows run nothing would be armed. Which check it is: unknown.
-   - **Ruled out, each with a full game run** (logs in `$AOE2_WORK_ROOT/runs/{wd*,ctxfix,ttimes,nohv,smcfull,trust,blk,
-     who}-*` and the Wine log):
-     - stale JIT code (FEX `SMCChecks=full`);
-     - FEX's hypervisor CPUID bit (`HideHypervisorBit`);
-     - sleep accuracy (measured to 1 ms);
-     - debugger queries (debug port/object, kernel debugger info: same answers as Windows and Proton);
-     - `int 2d`/`int3`/single-step handling (the game only uses invalid-opcode traps, which FEX raises correctly);
-     - heartbeat threads (all alive the whole session);
-     - Steam ownership and app-ticket calls (succeed);
-     - `WinVerifyTrust` (it runs on every loaded module: 44 `TRUST_E_NOSIGNATURE`, 3 OK, as expected for embedded-only
-       checks; Wine bug 55165's fix is in);
-     - debug-register context flags and per-thread CPU times (both fixed, see below; neither was the trigger).
-   - **Real Wine fixes found on the way (uncommitted, worth keeping):**
-     - `dlls/ntdll/signal_arm64ec.c` `NtGetContextThread`: report `CONTEXT_SEGMENTS`/`CONTEXT_DEBUG_REGISTERS` in
-       the returned flags when asked; their values (fixed segments, zero debug registers) were already filled in.
-     - `dlls/ntdll/unix/thread.c` `get_thread_times` for macOS: Mach `thread_info` for this process's threads,
-       `proc_pidinfo` for process totals. Before, every thread showed 0 CPU time in `SystemProcessInformation`.
-       Checked with a small test (a spinning thread shows its time).
-   - **Next (black-box only, comparing what our environment answers with Windows/Proton):**
-     - CPUID mix (GenuineIntel vendor with an "Unknown ARM CPU"/Apple brand string, feature bits);
-     - RDTSC frequency and behaviour;
-     - ContextFlags/EFlags/XSTATE in exception contexts;
-     - the unsigned non-system module `libarm64ecfex.dll` in the module list;
-     - the parent process and command line;
-     - registry/hardware fingerprint answers that fail under Wine on macOS.
-     A launch shows within ~20 s whether the delayed termination gets armed (the `DIAG start protection thread`
-     log lines), so each variation is cheap to test. Not planned: reading the protection's own decrypted code.
-   - **Diagnostics state:** the installed runtime (wine.app CDHash `82ec18c4…`) carries all of them:
-     - syscall traces of the protection threads and the main thread;
-     - a FEX block log after long sleeps;
-     - `WinVerifyTrust` and guest-exception logs;
-     - its `ntdll.dll` also has a since-removed code dump; rebuild `aarch64-windows/ntdll.dll` from the current
-       source before the next run.
-     The Wine log (`~/Library/Logs/MacNeutron/steam-813780.log`) is past 7 GB.
-   - Snapshot of the uncommitted Wine and FEX trees: `$AOE2_WORK_ROOT/wip-20261010/{wine,fex}.patch` (diagnostics
-     marked `DIAGNOSTIC, not for commit`). Capture tool: `tools/wdcapture.sh <outdir> [captures]`.
+5. **The game quit on its own 1.5–4 min after launch: fixed by Wine patch 0028** (2026-10-11). Every session since
+   2026-10-08 that wasn't killed ended this way (exit 0), active or in the background, DXMT or DXVK.
+   - **What ended it:** the game's anti-tamper protection. Within 1.5 s of launch it started three threads at
+     `AoE2DE_s.exe+2C18ED4`; after a random 90–210 s one of them suspended the other threads, pre-sized a file
+     (`NtSetInformationFile` class 19) and called `NtTerminateProcess(-1, 0)`.
+   - **Cause:** a start-up hook check over Windows API entry points. In Wine's ARM64EC/ARM64X DLLs, an export that is
+     an import from another DLL (802 of kernel32's) reaches x64 code as lld's bare x64 import thunk, `FF 25 disp32`
+     plus padding, which looks like an inline hook. x64 Windows forwards through `48 FF 25 disp32` (REX.W jump), and
+     x86-64 Wine gives such exports a hot-patch prolog. Found through a public write-up of the same game under FEX on
+     Android (github.com/tarikbc/ageofempires-android, `docs/how-it-works/HOOK-CHECK.md`; their fix is a FEX patch that
+     rewrites the stubs at map time).
+   - **Fix:** Wine patch 0028. When `winebuild --builtin` marks an installed DLL, it rewrites each such thunk in the
+     image's x64 code ranges (slot in an import address table, auxiliary or delay-load included) as
+     `48 FF 25 disp32-1`, so the DLLs on disk and in memory match. Test: `x64-exportstubs` (`check.sh` step
+     `exportstubs`). Prototype for a built `wine.app`: `aoe2/tools/fixstubs.py` (same output, byte for byte).
+   - **Evidence:** with kernel32, kernelbase, user32 and advapi32 rewritten, no thread started at `+2C18ED4`, and the
+     game ran past 15 min without the class-19 call.
+   - **Installed runtime:** patched in place with the prototype (backup `wine.app.bak-stubs` in the tool folder); its
+     user32 and advapi32 still have their delay-load stubs bare, which a rebuild with patch 0028 covers.
+   - **Watch for:**
+     - The same write-up describes a later kill (about 8–10 min) when handling an exception is slow (a wineserver
+       round trip per `NtContinue`). Ours costs about 5 µs (`n3.md`), so it is probably not an issue here.
+     - One run froze at the menu about 70 s in (no crash dump, no class-19 call; force-quit). Not seen again; to be
+       looked at only if it recurs.
+   - **Ruled out before the cause was found** (runs in `$AOE2_WORK_ROOT/runs/{wd*,ctxfix,ttimes,nohv,smcfull,trust,blk,
+     who}-*`): FEX `SMCChecks=full`, `HideHypervisorBit`, sleep accuracy, debugger queries, `int 2d`/`int3`, heartbeat
+     threads, Steam ticket calls, `WinVerifyTrust`, debug-register context flags, per-thread CPU times.
+   - **Real Wine fixes found on the way, not in the tree now** (in `$AOE2_WORK_ROOT/wip-20261010/wine.patch`):
+     ARM64EC `NtGetContextThread` reporting `CONTEXT_SEGMENTS`/`CONTEXT_DEBUG_REGISTERS` in the returned flags, and
+     `get_thread_times` for macOS (Mach `thread_info`, `proc_pidinfo`). Worth adding to the series.
 6. **Start-up hangs, fixed (uncommitted):** a lost wakeup in our Wine patch 0025. It sends 1- and 2-byte
    `WaitOnAddress` waits to the kernel on their 4-byte word, and FEX's code invalidation lock has writers waiting on
    the whole word and readers on its upper half. A wake meant for a writer could go to a reader. Fixed in

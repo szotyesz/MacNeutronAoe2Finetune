@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 11 Oct 2026 06:30:00 +0200
+Subject: [PATCH] winebuild: Give ARM64EC import thunks the rex.W jump x64
+ modules use.
+
+An ARM64EC or ARM64X module's exports that are imports from another
+module point, for x64 callers, at the linker's x64 import thunk: a bare
+"jmp *slot(%rip)", ff 25 disp32, followed by padding. 802 of kernel32's
+exports start that way. Code that checks API entry points for inline
+hooks takes it for a hook: Age of Empires II: Definitive Edition's
+anti-tamper checks some of them at start-up and then ends the game
+1.5-4 minutes later, every session.
+
+x64 Windows modules forward through "rex.W jmp *slot(%rip)", 48 ff 25
+disp32, the form x64 unwinding treats as a tail call, and x86-64 Wine
+gives the same exports a hot-patch prolog before its jump. When
+winebuild marks a module as builtin, rewrite each such thunk in the
+x64 code ranges of an ARM64EC image, whose slot is in an import
+address table (the image's, the auxiliary ones or a delay-load one),
+into that form, using the padding byte after it; the last thunk of a
+section may grow into the section's raw padding.
+
+With kernel32, kernelbase, user32 and advapi32 rewritten this way, the
+game no longer starts the three threads of its delayed termination
+1.5 s after launch, and it ran past 10 minutes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/winebuild/spec32.c | 179 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 179 insertions(+)
+
+diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
+index 11ec69e..a7fb902 100644
+--- a/tools/winebuild/spec32.c
++++ b/tools/winebuild/spec32.c
+@@ -1463,6 +1463,184 @@ void output_def_file( DLLSPEC *spec, struct exports *exports, int import_only )
+ }
+ 
+ 
++static unsigned int get_le32( const unsigned char *p )
++{
++    return p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned int)p[3] << 24);
++}
++
++static void set_le32( unsigned char *p, unsigned int val )
++{
++    p[0] = val; p[1] = val >> 8; p[2] = val >> 16; p[3] = val >> 24;
++}
++
++struct pe_image
++{
++    unsigned char *data;
++    size_t size;
++    unsigned char *sections;
++    unsigned int nb_sections;
++};
++
++/* the file data at an RVA, with at least len bytes of raw data behind it */
++static unsigned char *pe_rva_data( const struct pe_image *pe, unsigned int rva, unsigned int len )
++{
++    unsigned int i;
++
++    for (i = 0; i < pe->nb_sections; i++)
++    {
++        const unsigned char *sec = pe->sections + 40 * i;
++        unsigned int va = get_le32( sec + 12 ), raw_size = get_le32( sec + 16 ), raw_ptr = get_le32( sec + 20 );
++
++        if (rva < va || rva - va >= raw_size) continue;
++        if (rva - va + len > raw_size || raw_ptr + raw_size > pe->size) return NULL;
++        return pe->data + raw_ptr + rva - va;
++    }
++    return NULL;
++}
++
++/*******************************************************************
++ *         fixup_arm64ec_import_thunks
++ *
++ * In an ARM64EC or ARM64X image, an export that is an import from another module points, for x64 callers, at the
++ * linker's x64 import thunk: a bare "jmp *slot(%rip)" (ff 25 disp32), which looks like an inline hook to code that
++ * checks API entry points. x64 Windows modules forward through "rex.W jmp *slot(%rip)" (48 ff 25 disp32), the form
++ * x64 unwinding treats as a tail call. Rewrite each such thunk in the image's x64 code ranges whose slot is in an
++ * import address table, using the padding byte that follows it (or the section's raw padding for the last one).
++ */
++static int fixup_arm64ec_import_thunks( const char *file, unsigned char *data, size_t size )
++{
++    struct pe_image pe = { data, size };
++    unsigned int pe_off, opt_off, opt_size, nb_dirs, lc_rva, lc_size, chpe_rva, code_map, code_map_count, version;
++    unsigned int tables[4][2], nb_tables = 0, i, j, fixed = 0;
++    unsigned long long image_base, chpe_va;
++    unsigned char *lc, *chpe, *map, *desc;
++
++    if (size < 0x40 || memcmp( data, "MZ", 2 )) return 0;
++    pe_off = get_le32( data + 0x3c );
++    if (pe_off > size - 24 || memcmp( data + pe_off, "PE\0\0", 4 )) return 0;
++    opt_off = pe_off + 24;
++    opt_size = data[pe_off + 20] | (data[pe_off + 21] << 8);
++    pe.nb_sections = data[pe_off + 6] | (data[pe_off + 7] << 8);
++    pe.sections = data + opt_off + opt_size;
++    if (opt_size < 112 || opt_off + opt_size + 40 * pe.nb_sections > size) return 0;
++    if ((data[opt_off] | (data[opt_off + 1] << 8)) != 0x20b) return 0;  /* PE32+ */
++    image_base = get_le32( data + opt_off + 24 ) | (unsigned long long)get_le32( data + opt_off + 28 ) << 32;
++    nb_dirs = get_le32( data + opt_off + 108 );
++    if (nb_dirs <= 12 || opt_size < 112 + 8 * 13) return 0;
++
++    /* the ARM64EC metadata, from the load configuration */
++    lc_rva = get_le32( data + opt_off + 112 + 8 * 10 );
++    lc_size = get_le32( data + opt_off + 112 + 8 * 10 + 4 );
++    if (lc_size < 0xd0 || !(lc = pe_rva_data( &pe, lc_rva, 0xd0 )) || get_le32( lc ) < 0xd0) return 0;
++    chpe_va = get_le32( lc + 0xc8 ) | (unsigned long long)get_le32( lc + 0xcc ) << 32;
++    if (!chpe_va || chpe_va < image_base) return 0;
++    chpe_rva = chpe_va - image_base;
++    if (!(chpe = pe_rva_data( &pe, chpe_rva, 80 ))) return 0;
++    version = get_le32( chpe );
++    code_map = get_le32( chpe + 4 );
++    code_map_count = get_le32( chpe + 8 );
++    if (!(map = pe_rva_data( &pe, code_map, 8 * code_map_count ))) return 0;
++
++    /* the import address tables: the image's, the auxiliary ones, and the delay-load ones as one span */
++    tables[nb_tables][0] = get_le32( data + opt_off + 112 + 8 * 12 );
++    tables[nb_tables][1] = tables[nb_tables][0] + get_le32( data + opt_off + 112 + 8 * 12 + 4 );
++    nb_tables++;
++    if (get_le32( chpe + 44 ))
++    {
++        tables[nb_tables][0] = get_le32( chpe + 44 );
++        tables[nb_tables][1] = tables[nb_tables][0] + tables[0][1] - tables[0][0];
++        nb_tables++;
++    }
++    if (version >= 2 && get_le32( chpe + 76 ))
++    {
++        tables[nb_tables][0] = get_le32( chpe + 76 );
++        tables[nb_tables][1] = tables[nb_tables][0] + tables[0][1] - tables[0][0];
++        nb_tables++;
++    }
++    if (nb_dirs > 13 && opt_size >= 112 + 8 * 14 && get_le32( data + opt_off + 112 + 8 * 13 + 4 ))
++    {
++        unsigned int lo = ~0u, hi = 0, iat, n, desc_rva = get_le32( data + opt_off + 112 + 8 * 13 );
++        unsigned char *slot;
++
++        for (; (desc = pe_rva_data( &pe, desc_rva, 32 )) && get_le32( desc + 4 ); desc_rva += 32)
++        {
++            iat = get_le32( desc + 12 );
++            for (n = 0; (slot = pe_rva_data( &pe, iat + 8 * n, 8 )) && (get_le32( slot ) || get_le32( slot + 4 )); n++) ;
++            if (iat < lo) lo = iat;
++            if (iat + 8 * (n + 1) > hi) hi = iat + 8 * (n + 1);
++        }
++        if (hi > lo)
++        {
++            tables[nb_tables][0] = lo;
++            tables[nb_tables][1] = hi;
++            nb_tables++;
++        }
++    }
++
++    for (i = 0; i < code_map_count; i++)
++    {
++        unsigned int start = get_le32( map + 8 * i ), len = get_le32( map + 8 * i + 4 );
++
++        if ((start & 3) != 2) continue;  /* not x64 code */
++        start &= ~3;
++        for (j = 0; j < pe.nb_sections; j++)
++        {
++            unsigned char *sec = pe.sections + 40 * j;
++            unsigned int va = get_le32( sec + 12 ), vsize = get_le32( sec + 8 ), raw_size = get_le32( sec + 16 );
++            unsigned int lo = max( start, va ), hi = min( start + len, va + min( vsize, raw_size ) ), limit, rva;
++
++            if (lo >= hi) continue;
++            /* a thunk may grow into the section's raw padding, short of the next section */
++            limit = va + raw_size;
++            if (j + 1 < pe.nb_sections) limit = min( limit, get_le32( sec + 40 + 12 ));
++
++            for (rva = lo; rva + 6 <= hi; )
++            {
++                unsigned char *p = pe_rva_data( &pe, rva, 6 );
++                unsigned int target, k;
++                int disp;
++
++                if (!p || p[0] != 0xff || p[1] != 0x25 || (rva > lo && p[-1] == 0x48))
++                {
++                    rva++;
++                    continue;
++                }
++                disp = get_le32( p + 2 );
++                target = rva + 6 + disp;
++                for (k = 0; k < nb_tables; k++) if (target >= tables[k][0] && target < tables[k][1]) break;
++                if (k < nb_tables && rva + 7 <= limit && pe_rva_data( &pe, rva, 7 ) && (p[6] == 0xcc || p[6] == 0x90 || !p[6]))
++                {
++                    p[0] = 0x48;
++                    p[1] = 0xff;
++                    p[2] = 0x25;
++                    set_le32( p + 3, disp - 1 );
++                    if (rva + 7 > va + get_le32( sec + 8 )) set_le32( sec + 8, rva + 7 - va );
++                    fixed++;
++                    rva += 7;
++                }
++                else rva += 6;
++            }
++        }
++    }
++    if (fixed && verbose) fprintf( stderr, "%s: %u x64 import thunks given a rex.W jump\n", file, fixed );
++    return fixed;
++}
++
++static void fixup_import_thunks( const char *file )
++{
++    size_t size;
++    unsigned char *data = read_file( file, &size );
++    FILE *f;
++
++    if (!data) fatal_perror( "Cannot read %s", file );
++    if (fixup_arm64ec_import_thunks( file, data, size ))
++    {
++        if (!(f = fopen( file, "r+b" )) || fwrite( data, 1, size, f ) != size || fclose( f ))
++            fatal_perror( "Cannot write %s", file );
++    }
++    free( data );
++}
++
+ /*******************************************************************
+  *         make_builtin_files
+  */
+@@ -1507,6 +1685,7 @@ void make_builtin_files( struct strarray files )
+         }
+         else fatal_error( "%s: Unrecognized file format\n", file );
+         close( fd );
++        fixup_import_thunks( file );
+     }
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

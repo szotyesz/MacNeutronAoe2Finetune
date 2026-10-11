@@ -39,13 +39,13 @@ export WINEMSYNC=1
 # NEEDS_FEX: the x64 steps, which run after `fex` registers FEX in that prefix (else Wine's stub xtajit64 runs them).
 # NEEDS_DXMT: the steps that run DXMT, after `dxmt` puts its front ends in that prefix.
 G1="g1-hello g1-seh g1-threads g1-kuser g1-smc g1-tsc g1-unaligned"
-STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset"
+STEPS="macos signature boot pages unentitled arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset exportstubs"
 STEPS="$STEPS g5-jit"
 STEPS="$STEPS fonts-tls steam-bridge dxmt dxmt-present dxmt-arm64ec dxmt-x64 g4-bench"
 NEEDS_DXMT="dxmt-present dxmt-arm64ec dxmt-x64"
-NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset g5-jit fonts-tls steam-bridge"
+NEEDS_PREFIX="pages arm64 isec g3-cpu fex $G1 g2-litmus viewec wxflip wxwatch wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset exportstubs g5-jit fonts-tls steam-bridge"
 NEEDS_PREFIX="$NEEDS_PREFIX dxmt $NEEDS_DXMT g4-bench"
-NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset g5-jit steam-bridge $NEEDS_DXMT g4-bench"
+NEEDS_FEX="$G1 g2-litmus wxflip-x64 msync x18 apcsuspend globalroot futexterm waitaddr suspendwake timerreset exportstubs g5-jit steam-bridge $NEEDS_DXMT g4-bench"
 
 # The processes running the runtime's executables. Wine rewrites argv, so `pkill -f <path>` finds nothing; the kernel
 # knows the executable. The Rosetta tool folders' (the launcher, Wine and its server): g4-bench's, and the reference's
@@ -623,6 +623,8 @@ run_step() {
     globalroot) step globalroot 60 globalroot_cmd ;;
     futexterm) step futexterm 60 futexterm_cmd ;;
     waitaddr) step waitaddr 120 waitaddr_cmd ;;
+    # Exports x64 code sees as Windows has them (patch 28): no bare FF 25 jump, which looks like an inline hook.
+    exportstubs) step exportstubs 60 exe_cmd x64-exportstubs ;;
     suspendwake) step suspendwake 180 suspendwake_cmd ;;
     timerreset) step timerreset 120 timerreset_cmd ;;
     g5-jit) step g5-jit 600 g5_jit_cmd; grep '^info ' "$WORK/g5-jit.log" ;;
