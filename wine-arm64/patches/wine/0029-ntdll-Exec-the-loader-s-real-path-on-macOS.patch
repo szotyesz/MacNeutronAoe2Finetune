@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 11 Oct 2026 07:03:08 +0200
+Subject: [PATCH] ntdll: Exec the loader's real path on macOS.
+
+Wine starts every Windows process by executing <ntdll.so's directory>/wine.
+In an app bundle that is a symbolic link to the bundle's executable,
+Contents/MacOS/wine, and a process started through the link doesn't
+belong to the bundle: Launch Services gives it no bundle identifier and
+never reads the bundle's Info.plist, so macOS can't recognise a game
+(LSApplicationCategoryType, Game Mode), and CFBundleGetMainBundle()
+doesn't find the bundle's resources, such as the Vulkan loader's driver
+manifests in Contents/Resources/vulkan/icd.d.
+
+Resolve the path once, when the paths are set up, and execute the
+bundle's executable itself.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/loader.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index e476231..721f23c 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -433,7 +433,14 @@ static void init_paths(void)
+         if (!(dll_dir = remove_tail( ntdll_dir, get_so_dir(current_machine) ))) dll_dir = ntdll_dir;
+         bin_dir = build_relative_path( dll_dir, LIBDIR "/wine", BINDIR );
+         data_dir = build_relative_path( dll_dir, LIBDIR "/wine", DATADIR "/wine" );
+-        wineloader = build_path( ntdll_dir, "wine" );
++        char *loader = build_path( ntdll_dir, "wine" );
++#ifdef __APPLE__
++        /* In an app bundle this is a symlink to Contents/MacOS/wine: exec the bundle's own executable, so that
++         * Launch Services sees every Wine process as the bundle's (its Info.plist, e.g. the game category). */
++        char *real = realpath( loader, NULL );
++        if (real) { free( loader ); loader = real; }
++#endif
++        wineloader = loader;
+     }
+ #if defined(__APPLE__) && defined(__aarch64__)
+     loader_is_entitled( wineloader );  /* before any fork */
+-- 
+2.54.0 (Apple Git-157)
+

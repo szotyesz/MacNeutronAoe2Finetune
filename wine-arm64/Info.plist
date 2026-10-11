@@ -14,5 +14,9 @@
 	<string>6.0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>27.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.games</string>
+	<key>LSSupportsGameMode</key>
+	<true/>
 </dict>
 </plist>
