@@ -21,15 +21,47 @@ address table (the image's, the auxiliary ones or a delay-load one),
 into that form, using the padding byte after it; the last thunk of a
 section may grow into the section's raw padding.
 
+ARM64EC callers reach such an export through arm64x_check_call, which
+follows a jmp thunk to its target instead of emulating it: it now skips
+a rex.W prefix before the ff 25.
+
 With kernel32, kernelbase, user32 and advapi32 rewritten this way, the
 game no longer starts the three threads of its delayed termination
-1.5 s after launch, and it ran past 10 minutes.
+1.5 s after launch, and it ran past 15 minutes.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- tools/winebuild/spec32.c | 179 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 179 insertions(+)
+ dlls/ntdll/signal_arm64ec.c |  12 ++-
+ tools/winebuild/spec32.c    | 179 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 187 insertions(+), 4 deletions(-)
 
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 9c6123c..66f89e4 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -1982,14 +1982,18 @@ static void __attribute__((naked)) arm64x_check_call(void)
+          "ret\n"
+          /* check for jmp sequence */
+          ".Ljmp:\n\t"
+-         "ldrb w16, [x11]\n\t"
++         "mov x17, x11\n\t"
++         "ldrb w16, [x17]\n\t"
++         "cmp w16, #0x48\n\t"               /* rex.W prefix (winebuild's import thunks) */
++         "cinc x17, x17, eq\n\t"
++         "ldrb w16, [x17]\n\t"
+          "cmp w16, #0xff\n\t"
+          "b.ne .Lexit\n\t"
+-         "ldrb w16, [x11, #1]\n\t"
++         "ldrb w16, [x17, #1]\n\t"
+          "cmp w16, #0x25\n\t"               /* ff 25 jmp *xxx(%rip) */
+          "b.ne .Lexit\n\t"
+-         "ldr w9, [x11, #2]\n\t"
+-         "add x16, x11, #6\n\t"             /* address after jump */
++         "ldr w9, [x17, #2]\n\t"
++         "add x16, x17, #6\n\t"             /* address after jump */
+          "ldr x11, [x16, w9, sxtw]\n\t"
+          "b \"#arm64x_check_call\"\n"       /* restart checks with jump destination */
+          /* not a special sequence, call the exit thunk */
 diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
 index 11ec69e..a7fb902 100644
 --- a/tools/winebuild/spec32.c
